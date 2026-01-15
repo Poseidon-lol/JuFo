@@ -1,27 +1,11 @@
-"""
-Data loading helpers for surrogate and generative models.
-
-
-The project works primarily with CSV/Parquet files that contain SMILES rows
-and target properties (HOMO/LUMO, electron affinity, ionisation energy,
-doping metrics, etc.).  This module provides convenient primitives to:
-
-* ingest tabular datasets and ensure consistent column naming
-* compute / store normalisation statistics for target columns
-* perform deterministic train/val/test splits
-* create PyTorch-Geometric compatible dataloaders
-
-The functions are intentionally lightweight and avoid imposing a specific
-framework (PyTorch Lightning, Hydra, ...).  They are used by both the
-surrogate training scripts and the JT-VAE preprocessing pipeline.
-"""
+"""datenhelfer für surrogate und generator minimal gehalten"""
 
 from __future__ import annotations
 
 from pathlib import Path
 import sys
 
-# Ensure the project root (with src/) is on sys.path
+# src pfad reinschieben falls noetig
 _THIS_FILE = Path(__file__).resolve()
 _PROJECT_ROOT = None
 for candidate in [_THIS_FILE.parent, *_THIS_FILE.parents]:
@@ -35,7 +19,7 @@ else:
     raise RuntimeError("Could not locate project root containing src/")
 
 if _PROJECT_ROOT is None:
-    # Fallback: assume the parent of the `src` package is the project root.
+    # fallback wenn src erst eins drueber liegt
     for candidate in _THIS_FILE.parents:
         if (candidate / "src").exists():
             _PROJECT_ROOT = candidate
@@ -71,7 +55,7 @@ __all__ = [
 
 @dataclass
 class NormalizationStats:
-    """Simple container für normalisations parameter (mean/std pro column)"""
+"""schlichter container fuer normalisations parameter mean std pro spalte"""
 
     mean: pd.Series
     std: pd.Series
@@ -103,7 +87,7 @@ class TrainValTestSplit:
 
 #resolve dataset paths wurde mit chatgpt gemacht weil ich kein bock hatte sowas zu implementieren
 def resolve_dataset_path(candidate: Path) -> Path:
-    """Resolve dataset paths in bezug zum project root und den common data folders"""
+    """kloent dataset pfade relativ zum project root und data ordner"""
 
     candidate = candidate.expanduser()
     if candidate.exists():
@@ -159,7 +143,7 @@ def resolve_dataset_path(candidate: Path) -> Path:
     raise FileNotFoundError(f"Dataset path gibts nicht: {candidate}")
 
 def load_dataframe(path: Path | str) -> pd.DataFrame:
-    """dataset in ein DataFrame reinloaden"""
+    """dataset in ein dataframe reinladen"""
 
     resolved_path = resolve_dataset_path(Path(path))
     suffix = resolved_path.suffix.lower()
@@ -178,7 +162,7 @@ def split_dataframe(
     test_fraction: float = 0.1, # portion of data for test set
     seed: int = 42, # random seed for reproducibility
 ) -> TrainValTestSplit:
-    """Deterministic random split for train/val/test portions."""
+    """deterministischer split fuer train val test"""
 
     if val_fraction < 0 or test_fraction < 0 or val_fraction + test_fraction >= 1.0: 
         raise ValueError("werte iwie falsch") # Keine der Anteile darf negativ sein; Zusammen dürfen sie nicht ≥ 1 sein, weil sonst kein Platz mehr für Training bleibt
@@ -207,7 +191,7 @@ def apply_normalization(df: pd.DataFrame, stats: NormalizationStats, target_cols
 
 
 def create_property_dataset(df: pd.DataFrame, *, cache_graphs: bool = False): 
-    """Convert dataframe into a PyG dataset mit ``mol_to_graph`` aus src.featurization.""" 
+    """wandelt dataframe in pyg dataset mit mol_to_graph aus src.featurization"""
 
     target_cols = [c for c in df.columns if c not in {"smiles", "id"}]
     graphs = []
@@ -253,7 +237,7 @@ def build_pyg_dataloaders(
     num_workers: int = 0,
     shuffle_train: bool = True,
 ) -> Dict[str, torch.utils.data.DataLoader]:
-    """Create PyG dataloaders for train/val/test splits."""
+    """erstellt pyg dataloader fuer train val test splits"""
 
     if PyGDataLoader is None:
         raise ImportError("torch_geometric is required to build graph dataloaders.")

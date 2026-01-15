@@ -1,29 +1,4 @@
-"""
-Interfaces to external quantum-chemistry (DFT) evaluations.
-===========================================================
-
-During active learning we periodically validate surrogate predictions with
-high-fidelity calculations (DFT / GW / experimental measurements).  The
-project eventually aims to connect to an ASE + FireWorks queue; for now we
-provide a mock interface that mimics asynchronous job submission while
-remaining completely self-contained for development/testing.
-
-Key abstractions
-----------------
-
-``DFTJobSpec``
-    describes a pending quantum-chemistry evaluation (SMILES, level of
-    theory, properties to compute).
-
-``DFTResult``
-    container for completed calculations (energies, metadata, wall-clock).
-
-``DFTInterface``
-    orchestrates submission, polling, and retrieval.  It can run either
-    with a user-provided executor (hook into actual infrastructure) or
-    fall back to the included ``PseudoDFTSolver`` which produces
-    deterministic pseudo-results derived from SMILES hashes.
-"""
+"""dft schnittstelle bzw mock fuer qc jobs"""
 
 from __future__ import annotations
 
@@ -42,7 +17,7 @@ __all__ = ["DFTJobSpec", "DFTResult", "DFTInterface", "PseudoDFTSolver"]
 
 
 def _is_timeout_exception(exc: Exception) -> bool:
-    """Return True if exc looks like a timeout from futures/threads."""
+    """Return True wenn exc nach timeout aussieht"""
     if isinstance(exc, TimeoutError):
         return True
     return exc.__class__.__name__ == "TimeoutError"
@@ -75,11 +50,8 @@ def _smiles_hash(smiles: str) -> int:
 
 
 class PseudoDFTSolver:
-    """Fast deterministic surrogate for quantum-chemistry evaluations.
+    """Fast deterministic surrogate für quantum-chemistry evaluations (nicht mehr benutzt)
 
-    The ``run`` method returns property values derived from SMILES hash
-    ensuring that repeated calls are stable (useful for testing the active
-    learning loop without real DFT workloads).
     """
 
     def __init__(self, noise_level: float = 0.05, seed: Optional[int] = None) -> None:
@@ -100,7 +72,7 @@ class PseudoDFTSolver:
 
 
 class DFTInterface:
-    """Queue-like interface to an external DFT executor."""
+    """Queue-like interface zu einem external DFT executor (orca)"""
 
     def __init__(self, executor: Optional[Callable[[DFTJobSpec], Dict[str, float]]] = None) -> None:
         self.executor = executor or PseudoDFTSolver().run
@@ -110,18 +82,18 @@ class DFTInterface:
         self._lock = threading.Lock()
         self._logger = logging.getLogger(self.__class__.__name__)
 
-    # --- public API -----------------------------------------------------
+    # public API 
     def submit(self, job: DFTJobSpec) -> str:
         with self._lock:
             if job.job_id in self._pending or job.job_id in self._results:
-                raise ValueError(f"Job with id {job.job_id} already submitted.")
+                raise ValueError(f"Job mit id {job.job_id} schon submitted.")
             submitted_at = time.time()
             self._submitted_at[job.job_id] = submitted_at
 
             if hasattr(self.executor, "submit"):
                 future = getattr(self.executor, "submit")(job)
                 if not isinstance(future, Future):
-                    raise TypeError("Executor.submit must return concurrent.futures.Future")
+                    raise TypeError("Executor.submit muss returnen concurrent.futures.Future")
                 self._pending[job.job_id] = future
                 future.add_done_callback(lambda fut, jid=job.job_id: self._collect_future(jid, fut))
             else:
@@ -137,7 +109,7 @@ class DFTInterface:
         return [self.submit(job) for job in jobs]
 
     def fetch(self, job_id: str, *, block: bool = False, poll_interval: float = 5.0) -> Optional[DFTResult]:
-        """Retrieve result. For the pseudo solver results are immediate."""
+        """Results fetchen"""
 
         while True:
             with self._lock:
@@ -154,7 +126,7 @@ class DFTInterface:
                     if _is_timeout_exception(exc):
                         if not future.done():
                             continue
-                        # The future completed right as we timed out; re-fetch without timeout.
+                        # refetch ohne timeout
                         try:
                             raw = future.result()
                         except Exception as final_exc:
@@ -167,7 +139,7 @@ class DFTInterface:
                 time.sleep(poll_interval)
 
     def pop_completed(self) -> List[DFTResult]:
-        """Return all completed results and clear internal storage."""
+        """Returned alle completed results und den clearen internal storage"""
 
         with self._lock:
             results = list(self._results.values())
@@ -184,7 +156,7 @@ class DFTInterface:
             self._results.clear()
             self._submitted_at.clear()
 
-    # --- internal helpers -----------------------------------------------
+    #internale helpers
     def _collect_future(self, job_id: str, future: Future, *, raw_value: Any = None) -> None:
         try:
             value = raw_value if raw_value is not None else future.result()
@@ -240,4 +212,4 @@ class DFTInterface:
             return DFTResult(job=job, properties=dict(raw_value.properties), wall_time=wall_time, status=status, error_message=error, metadata=dict(metadata))
         if isinstance(raw_value, dict):
             return DFTResult(job=job, properties=raw_value, wall_time=wall_time, status="success", metadata={})
-        raise TypeError(f"Executor returned unsupported type: {type(raw_value)!r}")
+        raise TypeError(f"Executor returned unsupported typ: {type(raw_value)!r}")

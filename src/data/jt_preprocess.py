@@ -1,41 +1,4 @@
-# src/data/jt_preprocess.py
-"""
-Preprocessing script for JT-VAE dataset
---------------------------------------
-Creates a processed dataset for JT-VAE training from a CSV in data/raw.
-
-Input CSV (data/raw/osc_data.csv) expected columns:
- - smiles (SMILES string)
- - HOMO, LUMO (float)  -- used for conditioning
- - optional: id, dopant, other metadata
-
-Outputs (saved to data/processed/):
- - jt_examples.pt : list of dicts with keys:
-     - tree_x (torch.FloatTensor) [num_frags, frag_feat_dim]
-     - tree_edge_index (torch.LongTensor) [2, num_tree_edges]
-     - graph_x (torch.FloatTensor) [num_atoms, atom_feat_dim]
-     - graph_edge_index (torch.LongTensor) [2, num_bonds]
-     - target_frag_idxs (torch.LongTensor) [max_tree_nodes] (padded with -1)
-     - cond (torch.FloatTensor) [cond_dim]
- - fragment_vocab.json : mapping idx -> fragment_smiles
- - preprocessing_stats.json : normalization stats (mean/std) for conditioning
-
-Notes / limitations:
- - Fragment extraction is simplified: uses ring fragments + Murcko scaffold.
- - Fragment adjacency: fragments considered connected if they share any heavy atom index.
- - Fragment features: Morgan fingerprint (radius=2) converted to float vector.
- - You should review/sample produced fragments for quality before large-scale runs.
-
-Requirements:
- - rdkit
- - torch
- - rdkit.Chem.rdMolDescriptors
- - src.data.featurization.mol_to_graph (for atom-level graph)
-
-Usage:
- python src/data/jt_preprocess.py --input data/raw/osc_data.csv --out_dir data/processed --max_frags 12
-
-"""
+"""prep skript für jt-vae daten, zieht aus csv features und vocabs"""
 
 import os
 import json
@@ -70,7 +33,7 @@ from pathlib import Path
 import time
 import sys
 
-# Ensure the project root (with src/) is on sys.path
+# src pfad reinschieben falls fehlt
 PROJECT_ROOT = Path().resolve()
 for candidate in [PROJECT_ROOT, *PROJECT_ROOT.parents]:
     if (candidate / "src").exists():
@@ -80,16 +43,14 @@ for candidate in [PROJECT_ROOT, *PROJECT_ROOT.parents]:
 else:
     raise RuntimeError("Could not locate project root containing src/")
 
-# local featurizer
+# featurizer lokal
 try:
     from src.data.featurization import mol_to_graph
 except Exception:
     from data.featurization import mol_to_graph
 
 
-# -------------------------
-# Fragment utilities
-# -------------------------
+# fragment helpers
 
 
 def _load_mol_no_kekulize(smiles: str):
@@ -99,8 +60,8 @@ def _load_mol_no_kekulize(smiles: str):
     sanitize_ops = Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE
     try:
         Chem.SanitizeMol(mol, sanitizeOps=sanitize_ops)
-    except Exception as exc:  # pragma: no cover - RDKit warnings only
-        logging.getLogger(__name__).debug("SanitizeMol skipped kekulize for %s: %s", smiles, exc)
+    except Exception as exc:  # pragma: no cover - RDKit warnings nur
+        logging.getLogger(__name__).debug("SanitizeMol skipped kekulize fuer %s: %s", smiles, exc)
     return mol
 
 
@@ -117,7 +78,7 @@ def _filter_and_sort_fragments(
     for smi, heavy in fragments:
         if min_heavy_atoms > 0 and heavy < min_heavy_atoms:
             continue
-        # keep the largest heavy count if duplicates appear
+        # nimm die version mit mehr heavy atoms
         if smi not in dedup or heavy > dedup[smi]:
             dedup[smi] = heavy
     ordered = sorted(dedup.items(), key=lambda item: (item[1], item[0]), reverse=True)
@@ -156,13 +117,13 @@ def _extract_ring_scaffold_fragments(mol: "Chem.Mol", smiles: str, min_heavy_ato
             if s:
                 frags.add(s)
     except Exception:
-        logging.getLogger(__name__).debug("Ring extraction failed for %s", smiles)
+        logging.getLogger(__name__).debug("Ring extraction failed fuer %s", smiles)
     try:
         ms = rdMolDescriptors.CalcMurckoScaffoldSmiles(mol)
         if ms and ms.strip():
             frags.add(ms)
     except Exception:
-        logging.getLogger(__name__).debug("Murcko scaffold failed for %s", smiles)
+        logging.getLogger(__name__).debug("Murcko scaffold failed füuer %s", smiles)
     if not frags:
         frags.add(smiles)
     entries = []
@@ -312,9 +273,7 @@ def frag_to_fp_vector(frag_smiles: str, n_bits=512):
     return arr
 
 
-# -------------------------
-# Build fragment vocab across dataset
-# -------------------------
+# frag vocab ueber den datensatz
 
 @dataclass
 class JTPreprocessConfig:
@@ -344,7 +303,7 @@ def build_fragment_vocab(
         )
         for f in frags:
             counter[f] += 1
-    # filter by min_count
+    # filter per min_count
     items = [f for f,c in counter.items() if c >= min_count]
     items = sorted(items)
     idx2frag = {i: frag for i, frag in enumerate(items)}
@@ -352,19 +311,17 @@ def build_fragment_vocab(
     return frag2idx, idx2frag
 
 
-# -------------------------
-# Fragment adjacency
-# -------------------------
+# fragment nachbarschaft
 
 def fragment_adjacency_from_mol(smiles: str, fragments: list):
-    """Return adjacency list between fragments: if fragments share atom indices -> connected.
-    Also return mapping frag -> atom idx set for possible later use.
+    """Returnt adjacency list zwischen fragmenten: wenn fragments gleiche atom indices haben -> dann connected
+    Also return mapping frag -> atom idx gesetzt für späteren gebrauch
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return [], {}
     frag_atom_sets = {}
-    # find occurrences (naive) by matching substructure
+    # naive treffer via substructure
     for frag in fragments:
         pattern = Chem.MolFromSmiles(frag)
         pattern = _strip_dummy_atoms(pattern)
@@ -376,7 +333,7 @@ def fragment_adjacency_from_mol(smiles: str, fragments: list):
         for m in matches:
             atom_idxs.update(m)
         frag_atom_sets[frag] = atom_idxs
-    # build adjacency
+    # adjacency bauen
     adj = defaultdict(set)
     for i, fi in enumerate(fragments):
         for j, fj in enumerate(fragments):
@@ -385,17 +342,17 @@ def fragment_adjacency_from_mol(smiles: str, fragments: list):
             if len(frag_atom_sets.get(fi, set()) & frag_atom_sets.get(fj, set())) > 0:
                 adj[i].add(j)
                 adj[j].add(i)
-    # convert to edge_index
+    # zu edge_index
     edges = []
     for i, neighs in adj.items():
         for j in neighs:
             edges.append((i, j))
             edges.append((j, i))
     if len(edges) == 0:
-        # make a trivial chain if only one fragment
+        # falls nur ein fragment simple kette
         if len(fragments) > 1:
             edges = [(k, k+1) for k in range(len(fragments)-1)]
-            edges = [(i,j) for (i,j) in edges for _ in (0,1)]  # both directions
+            edges = [(i,j) for (i,j) in edges for _ in (0,1)]  # beide Richtungen
     return edges, frag_atom_sets
 
 
@@ -409,44 +366,44 @@ def process_one(
     fragment_method: str = "ring_scaffold",
     min_fragment_heavy_atoms: int = 1,
 ) -> Dict[str, torch.Tensor | np.ndarray | str]:
-    # 1) extract fragments for this mol
+    # fragmente ziehen
     frags = extract_fragments(
         smiles,
         method=fragment_method,
         min_heavy_atoms=min_fragment_heavy_atoms,
     )
-    # map to indices (filter unknown frags)
+    # zu indices mappen unbekannte skip
     frag_idxs = [frag2idx[f] for f in frags if f in frag2idx]
-    # limit to max_frags
+    # max_frags begrenzen
     if len(frag_idxs) > max_frags:
         frag_idxs = frag_idxs[:max_frags]
-    # target vector padded
+    # target vector gepadded
     targ = np.full((max_frags,), -1, dtype=np.int64)
     targ[:len(frag_idxs)] = frag_idxs
 
-    # 2) fragment features (fp)
+    # fragment features
     frag_feats = []
     frag_smiles_list = [list(frag2idx.keys())[list(frag2idx.values()).index(idx)] if True else '' for idx in frag_idxs]
-    # above is inefficient; instead build reverse mapping
+    # reverse mapping nutzen statt oben
     idx2frag = {v:k for k,v in frag2idx.items()}
     frag_smiles_list = [idx2frag[idx] for idx in frag_idxs]
     for fsm in frag_smiles_list:
         vec = frag_to_fp_vector(fsm, n_bits=fp_bits)
         frag_feats.append(vec)
     if len(frag_feats) == 0:
-        # fallback: use whole-molecule fingerprint
+        # fallback kompletter fp
         vec = frag_to_fp_vector(smiles, n_bits=fp_bits)
         frag_feats = [vec]
         targ = np.full((max_frags,), -1, dtype=np.int64)
         targ[0] = frag2idx.get(frag_smiles_list[0], 0) if len(frag_smiles_list)>0 else 0
-    # pad fragment features to max_frags
+    # features auf max_frags padden
     while len(frag_feats) < max_frags:
         frag_feats.append(np.zeros((fp_bits,), dtype=np.float32))
     frag_feats = np.vstack(frag_feats).astype(np.float32)
 
-    # 3) fragment adjacency -> edge_index
-    # map fragment SMILES list to their occurrences in this mol (use original extracted list)
-    # For adjacency we need the fragment list corresponding to the non-padded ones
+    # fragment adjacency -> edge_index
+    # frag smiles auf vorkommen mappen
+    # fuer adjacency nur echte frag liste
     real_frags = [idx2frag[idx] for idx in frag_idxs]
     edges, frag_atom_sets = fragment_adjacency_from_mol(smiles, real_frags)
     if len(edges) == 0:
@@ -454,7 +411,7 @@ def process_one(
     else:
         edge_index = np.array(edges, dtype=np.int64).T
 
-    # adjacency matrix (symmetric)
+    # adjacency matrix symmetrisch
     adj = np.zeros((max_frags, max_frags), dtype=np.float32)
     num_real = len(frag_idxs)
     if num_real > 0:
@@ -464,15 +421,15 @@ def process_one(
             src = src[valid_mask]
             dst = dst[valid_mask]
             adj[src, dst] = 1.0
-        # ensure symmetry
+        # symmetrie sichern
         adj = np.maximum(adj, adj.T)
         np.fill_diagonal(adj[:num_real, :num_real], 0.0)
 
-    # pad edge_index if necessary (not required for PyG)
+    # edge_index bei bedarf padden
 
-    # 4) atom-level graph via existing featurizer
+    # atom graph via featurizer
     atom_data = mol_to_graph(smiles)
-    # atom_data.x (torch.FloatTensor), atom_data.edge_index (torch.LongTensor)
+    # atom_data.x float atom_data.edge_index long
 
     example = {
         'tree_x': torch.tensor(frag_feats, dtype=torch.float32),
@@ -487,9 +444,7 @@ def process_one(
     return example
 
 
-# -------------------------
-# Full preprocessing
-# -------------------------
+# kompletter preprocess
 
 def prepare_jtvae_examples(
     df,
@@ -499,20 +454,19 @@ def prepare_jtvae_examples(
     max_seconds_per_mol: float = 10.0,
     max_heavy_atoms: Optional[int] = 80,
 ) -> List[Dict[str, torch.Tensor | np.ndarray | str]]:
-    """Convert dataframe rows into JT-VAE training examples.
+    """Konvertiert dataframe rows zu JT-VAE training Beispiele
 
-    Parameters
+    Parameter
     ----------
     df:
-        pandas DataFrame with a ``smiles`` column and conditioning columns.
+        pandas DataFrame mit smiles column und conditioning columns
     fragment_vocab:
-        Mapping ``fragment_smiles -> index`` or tuple ``(frag2idx, idx2frag)``
-        as returned by :func:`build_fragment_vocab`.
+        Mapping fragment_smiles -> index oder tuple (frag2idx, idx2frag)
+        as returned by :func: build_fragment_vocab
     config:
-        Optional :class:`JTPreprocessConfig` controlling preprocessing hyper-parameters.
+        Optional :class: JTPreprocessConfig controlling preprocessing hyper-parameters
     max_heavy_atoms:
-        Skip molecules with more heavy atoms than this value. Set to ``None`` or
-        a non-positive value to disable the filter.
+        Skipt moleküle mit mehr heavy atoms als dieser Wert (oder None für kein limit)
     """
 
     import pandas as pd
@@ -525,17 +479,17 @@ def prepare_jtvae_examples(
     else:
         frag2idx = fragment_vocab
     if not isinstance(frag2idx, Mapping):
-        raise TypeError("fragment_vocab must be a mapping or (frag2idx, idx2frag) tuple.")
+        raise TypeError("fragment_vocab muss ein mapping or (frag2idx, idx2frag) tuple sein")
 
     if "smiles" not in df.columns:
-        raise KeyError("Dataframe must contain a 'smiles' column.")
+        raise KeyError("Dataframe muss ein 'smiles' column enthöalten")
 
     cond_cols = list(config.condition_columns)
     missing = [c for c in cond_cols if c not in df.columns]
     if missing:
-        raise KeyError(f"Missing conditioning columns: {missing}")
+        raise KeyError(f"keine conditioning columns: {missing}")
 
-    # ensure dataframe type
+    # dataframe sichern
     if not isinstance(df, pd.DataFrame):
         df = pd.DataFrame(df)
 
@@ -544,7 +498,7 @@ def prepare_jtvae_examples(
     if not valid_mask.all():
         dropped = int((~valid_mask).sum())
         logging.getLogger(__name__).warning(
-            "prepare_jtvae_examples: dropping %d rows with missing conditioning values.", dropped
+            "prepare_jtvae_examples: dropping %d rows mit missing conditioning values", dropped
         )
         df = df.loc[valid_mask].reset_index(drop=True)
         numeric = numeric.loc[valid_mask].reset_index(drop=True)
@@ -563,12 +517,12 @@ def prepare_jtvae_examples(
         if Chem is not None:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
-                log.warning("prepare_jtvae_examples: skipping %s (invalid SMILES)", smiles)
+                log.warning("prepare_jtvae_examples: skipping %s (invalide SMILES)", smiles)
                 continue
             heavy = sum(1 for a in mol.GetAtoms() if a.GetAtomicNum() > 1)
             if max_heavy_atoms is not None and max_heavy_atoms > 0 and heavy > max_heavy_atoms:
                 log.warning(
-                    "prepare_jtvae_examples: skipping %s (heavy atoms %d > %d)",
+                    "prepare_jtvae_examples: skipping %s (schwere atome %d > %d)",
                     smiles,
                     heavy,
                     max_heavy_atoms,
@@ -586,12 +540,12 @@ def prepare_jtvae_examples(
                 min_fragment_heavy_atoms=config.min_fragment_heavy_atoms,
             )
         except Exception as exc:
-            log.warning("prepare_jtvae_examples: skipping %s due to error: %s", smiles, exc)
+            log.warning("prepare_jtvae_examples: skipping %s wegen error: %s", smiles, exc)
             continue
         elapsed = time.time() - start
         if elapsed > max_seconds_per_mol:
             log.warning(
-                "prepare_jtvae_examples: skipping %s (processing took %.1fs > %.1fs)",
+                "prepare_jtvae_examples: skipping %s (processing zu lange: %.1fs > %.1fs)",
                 smiles,
                 elapsed,
                 max_seconds_per_mol,
@@ -611,7 +565,7 @@ def prepare_jtvae_examples(
         ex["cond"] = torch.tensor(norm, dtype=torch.float32)
         examples.append(ex)
         if idx % 5000 == 0:
-            log.info("prepare_jtvae_examples: processed %d/%d molecules (%.1f%%)", idx, total, 100.0 * idx / total)
+            log.info("prepare_jtvae_examples: processed %d/%d Moleküle (%.1f%%)", idx, total, 100.0 * idx / total)
 
     config.condition_stats = {
         "mean": cond_mean.tolist(),
@@ -624,14 +578,14 @@ def prepare_jtvae_examples(
 def preprocess(input_csv: str, out_dir: str, max_frags: int = 12, fp_bits: int = 512):
     import pandas as pd
     df = pd.read_csv(input_csv)
-    assert 'smiles' in df.columns, 'input CSV must contain smiles column'
+    assert 'smiles' in df.columns, 'input CSV muss ein smiles column enthalten'
     if not ('HOMO' in df.columns and 'LUMO' in df.columns):
-        raise ValueError('CSV must contain HOMO and LUMO columns for conditioning')
+        raise ValueError('CSV muss HOMO und LUMO columns für conditioning enthalten')
 
     os.makedirs(out_dir, exist_ok=True)
     raw_smiles = df['smiles'].dropna().unique().tolist()
     frag2idx, idx2frag = build_fragment_vocab(raw_smiles)
-    # save fragment vocab
+    # frag vocab speichern
     with open(os.path.join(out_dir, 'fragment_vocab.json'), 'w') as f:
         json.dump(idx2frag, f, indent=2)
 
@@ -648,7 +602,7 @@ def preprocess(input_csv: str, out_dir: str, max_frags: int = 12, fp_bits: int =
         except Exception as e:
             print(f'Error processing {smi}: {e}')
 
-    # normalize cond (HOMO,LUMO)
+    # cond normalisieren
     conds = np.vstack(conds).astype(np.float32)
     mean = conds.mean(axis=0)
     std = conds.std(axis=0) + 1e-8
@@ -656,20 +610,18 @@ def preprocess(input_csv: str, out_dir: str, max_frags: int = 12, fp_bits: int =
     with open(os.path.join(out_dir, 'preprocessing_stats.json'), 'w') as f:
         json.dump(preprocessing_stats, f, indent=2)
 
-    # attach normalized cond and remove raw
+    # normierte cond anhaengen roh raus
     for ex in examples:
         raw = ex.pop('cond_raw')
         norm = (raw - mean) / std
         ex['cond'] = torch.tensor(norm, dtype=torch.float32)
 
-    # save examples as torch file
+    # examples als torch file speichern
     torch.save(examples, os.path.join(out_dir, 'jt_examples.pt'))
     print(f'Saved {len(examples)} examples to {os.path.join(out_dir, "jt_examples.pt")}')
 
 
-# -------------------------
-# CLI
-# -------------------------
+# cli
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', type=str, default='data/raw/osc_data.csv')
