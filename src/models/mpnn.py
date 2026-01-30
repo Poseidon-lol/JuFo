@@ -1,24 +1,4 @@
-# src/models/mpnn.py
-"""
-Surrogate MPNN for predicting molecular properties (HOMO/LUMO)
----------------------------------------------------------------
-This module provides:
-- A lightweight Message Passing Neural Network (MPNN) based on PyTorch Geometric
-- Dataset wrapper utilities for PyG Data objects
-- Training / evaluation loops (supports ensemble training for uncertainty)
-
-Usage:
-    from src.data.featurization import mol_to_graph
-    from src.models.mpnn import MPModel, train_one, evaluate, train_ensemble
-
-Requirements:
-    torch, torch_geometric, scikit-learn, pandas, numpy
-
-Notes:
-- This is a starter implementation intended for extension.
-- For production: add learning rate schedulers, advanced regularization, logging (MLflow),
-  and better calibration for uncertainty estimates.
-"""
+"""Lightweight MPNN surrogate für molecular property prediction"""
 
 import os
 import math
@@ -36,7 +16,6 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 import sys
 
-# Ensure the project root (with src/) is on sys.path
 PROJECT_ROOT = Path().resolve()
 for candidate in [PROJECT_ROOT, *PROJECT_ROOT.parents]:
     if (candidate / "src").exists():
@@ -54,19 +33,17 @@ try:
 except Exception as e:
     raise ImportError("This module requires torch_geometric. Install it before using MPModel.")
 
-# local featurization (assumes file exists at src/data/featurization.py)
+# local featurization
 try:
     from src.data.featurization import mol_to_graph
 except Exception:
-    # fallback if running from different working dir
+    
     from src.data.featurization import mol_to_graph
 
 from src.utils.device import DeviceSpec, ensure_state_dict_on_cpu, get_device, move_to_device
 
 
-# -----------------------------
-# MPNN building blocks
-# -----------------------------
+# MPNN blocks
 class ResidualEdgeGatedMPNNLayer(MessagePassing):
     """Edge-gated message passing with residual connections and layer norm."""
 
@@ -109,16 +86,16 @@ class MPModel(nn.Module):
     def __init__(self, node_in_dim: int, edge_in_dim: int, hidden_dim: int = 128,
                  num_message_layers: int = 3, readout_dim: int = 128, out_dim: int = 2,
                  dropout: float = 0.0, readout_type: str = "mlp", pooling: str = "mean"):
-        """A small MPNN for regression.
+        """MPNN für regression
 
         Args:
-            node_in_dim: dimension of node feature vector
-            edge_in_dim: dimension of edge feature vector
-            hidden_dim: hidden dimension for message/update networks
-            num_message_layers: how many message-passing steps
-            readout_dim: dimension after pooling
-            out_dim: number of regression targets (e.g., HOMO,LUMO)
-            dropout: dropout probability applied after message layers (MC dropout support)
+            node_in_dim: dimension von node feature vector
+            edge_in_dim: dimension von edge feature vector
+            hidden_dim: hidden dimension von message/update networks
+            num_message_layers: wie viele message-passing steps
+            readout_dim: dimension nach pooling
+            out_dim: anzahl regression targets (z.B., HOMO,LUMO)
+            dropout: dropout probability angewendet nach message layers
         """
         super().__init__()
         self.node_encoder = nn.Linear(node_in_dim, hidden_dim)
@@ -129,7 +106,7 @@ class MPModel(nn.Module):
         self.pooling = pooling.lower()
         valid_poolings = {"mean", "sum", "max"}
         if self.pooling not in valid_poolings:
-            raise ValueError(f"Unknown pooling '{pooling}'. Choose from {valid_poolings}.")
+            raise ValueError(f"unbekanntes pooling '{pooling}' wahl von {valid_poolings}.")
 
         self.layers = nn.ModuleList(
             ResidualEdgeGatedMPNNLayer(hidden_dim, dropout=self.dropout) for _ in range(num_message_layers)
@@ -144,7 +121,7 @@ class MPModel(nn.Module):
         elif readout_type.lower() == "linear":
             self.readout = nn.Linear(hidden_dim, out_dim)
         else:
-            raise ValueError("Unsupported readout_type '{}'. Use 'mlp' or 'linear'.".format(readout_type))
+            raise ValueError("falscher readout_type '{}'  'mlp' oder 'linear' benutzen".format(readout_type))
 
     def forward(self, data: Data):
         x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, None
@@ -159,7 +136,7 @@ class MPModel(nn.Module):
         for layer in self.layers:
             x = layer(x, edge_index, edge_attr)
 
-        # global pooling
+        # globales pooling
         if self.pooling == "mean":
             g = global_mean_pool(x, batch)
         elif self.pooling == "sum":
@@ -170,15 +147,13 @@ class MPModel(nn.Module):
         return out
 
 
-# -----------------------------
 # Dataset wrapper
-# -----------------------------
 class MoleculeDataset(PyGDataset):
     def __init__(self, dataframe, transform=None, pre_transform=None):
-        """Expects a pandas DataFrame with columns: 'smiles' and target columns (e.g. 'HOMO','LUMO')."""
+        """Erwartet einen pandas DataFrame mit Spalten: 'smiles' und Ziel-Spalten (z.B. 'HOMO','LUMO')."""
         super().__init__(None, transform, pre_transform)
         self.df = dataframe.reset_index(drop=True)
-        # infer numeric target columns (exclude identifier / string columns)
+      
         candidate_cols = [c for c in self.df.columns if c not in ("smiles", "id")]
         self.target_cols = [
             c for c in candidate_cols if pd.api.types.is_numeric_dtype(self.df[c])
@@ -192,13 +167,11 @@ class MoleculeDataset(PyGDataset):
         smiles = row['smiles']
         y = row[self.target_cols].values.astype(float) if len(self.target_cols) > 0 else None
         data = mol_to_graph(smiles, y=y)
-        # attach batch index when needed (PyG dataloader will set this)
+        # mach batch index ran wenn gebraucht (PyG dataloader macht das schon)
         return data
 
 
-# -----------------------------
 # Training & evaluation utilities
-# -----------------------------
 
 def train_one(
     model: nn.Module,
@@ -274,9 +247,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: DeviceSpec | torch.de
     return mae, preds, trues
 
 
-# -----------------------------
-# Ensemble training (deep ensembles for uncertainty)
-# -----------------------------
+# Ensemble training (deep ensembles für unsicherheit)
 
 def train_ensemble(df, model_save_dir: str, n_models: int = 5, epochs: int = 50, batch_size: int = 32,
                    lr: float = 1e-3, device: str = None, weight_decay: float = 0.0,
@@ -334,9 +305,7 @@ def train_ensemble(df, model_save_dir: str, n_models: int = 5, epochs: int = 50,
     print(f"Ensemble training completed. Models saved to {model_save_dir}")
 
 
-# -----------------------------
 # Ensemble inference util
-# -----------------------------
 
 def ensemble_predict(model_dir: str, dataset, device: str = None) -> Tuple[np.ndarray, np.ndarray]:
     """Load all model checkpoints in model_dir and return mean prediction and std (uncertainty).
@@ -372,9 +341,7 @@ def ensemble_predict(model_dir: str, dataset, device: str = None) -> Tuple[np.nd
     return mean_pred, std_pred
 
 
-# -----------------------------
 # Quick demo / CLI
-# -----------------------------
 if __name__ == "__main__":
     import pandas as pd
 

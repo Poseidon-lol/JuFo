@@ -1,41 +1,4 @@
-# src/models/jtvae_extended.py
-"""
-Simplified, GPU-ready conditional JT-VAE scaffold for molecular generation
-------------------------------------------------------------------------
-Goal:
-- Provide a production-oriented, PyTorch/PyG-compatible skeleton of a
-  Junction-Tree VAE (JT-VAE)-style generator that is conditional on target
-  properties (e.g., HOMO, LUMO for organic semiconductors).
-
-Disclaimer:
-- A full, research-grade JT-VAE (as in Jin et al. ICML'18) includes complex
-  routines for valid tree assembly, subgraph matching and discrete decoding
-  steps. Implementing every detail robustly would be lengthy; here I provide
-  a complete, GPU-capable scaffold with working graph encoders/decoders,
-  conditional latent handling, training loop and detailed TODOs where
-  project-specific research code must be filled in (e.g., tree assembly).
-
-Features implemented:
-- RDKit-based fragmentation to obtain candidate building blocks (rings, scaffolds)
-- PyG Message-Passing encoders for both junction-tree nodes (fragments)
-  and original molecular graph
-- Conditional latent concatenation for decoder conditioning
-- Sampling utilities to produce candidate molecules from latent + cond
-- Training loop (reconstruction + KL) and checkpoints
-
-What you still need to add/verify for research use:
-- The decoder's exact chemical-validity enforcing assembly (subgraph matching),
-  and the loss terms specific to JT-VAE (tree reconstruction loss, assembly loss)
-- Advanced scheduling, beam search or MCTS for decoding assembly
-- Optional chemically-aware priors and valence checks
-
-Requirements:
-  torch, torch_geometric, rdkit, numpy
-
-Usage (overview):
-  from src.models.jtvae_extended import JTVAE, train_jtvae, sample_conditional
-
-"""
+"""einigermaßen oke JT-VAE scaffold für molecular generation"""
 
 import os
 import math
@@ -87,9 +50,7 @@ except Exception:
 
 from src.utils.device import ensure_state_dict_on_cpu, get_device, move_to_device
 
-# -------------------------
 # Fragmentation utilities (very simplified)
-# -------------------------
 
 def _load_mol_no_kekulize(smiles: str):
     mol = Chem.MolFromSmiles(smiles, sanitize=False)
@@ -173,9 +134,7 @@ def extract_fragments(smiles: str) -> List[str]:
         logging.getLogger(__name__).debug("Murcko scaffold failed for %s", smiles)
     return [f for f in frags if len(f) > 0]
 
-# -------------------------
 # Simple GNN building blocks
-# -------------------------
 class GNNLayer(MessagePassing):
     def __init__(self, in_dim, out_dim):
         super().__init__(aggr='add')
@@ -212,9 +171,7 @@ class SimpleGNNEncoder(nn.Module):
             return pooled.to(h.device)
         return global_mean_pool(h, batch)
 
-# -------------------------
 # JT-VAE core classes (simplified)
-# -------------------------
 class JTEncoder(nn.Module):
     """Encodes both junction tree (fragment-level) and molecular graph into latents."""
 
@@ -337,7 +294,7 @@ def assemble_fragments(
         with _suppress_rdkit_errors():
             mol = Chem.MolFromSmiles(smi)
         if mol is None:
-            logger.warning("Skipping invalid fragment SMILES '%s' during assembly.", smi)
+            logger.warning("ungueltiges fragment smiles %s beim assembly skippe", smi)
             continue
         smiles_list.append(smi)
         mols.append(Chem.Mol(mol))
@@ -411,7 +368,7 @@ def assemble_fragments(
                 except Exception:
                     continue
         except Exception:
-            logger.debug("BRICS assembly failed; falling back to heuristic assembly.")
+            logger.debug("brics assembly failed fallback auf heuristische assembly")
     if has_dummy:
         merged = mols[0]
         success = True
@@ -480,7 +437,7 @@ def assemble_fragments(
             if success:
                 break
         if not success:
-            logger.warning("Unable to connect fragment %d during assembly; keeping disconnected.", i)
+            logger.warning("fragment %d laesst sich nicht verbinden bleibt getrennt", i)
             status = "partial"
             combined = Chem.Mol(combo)
             fallback_anchor = new_candidates[0] if new_candidates else 0
@@ -492,7 +449,7 @@ def assemble_fragments(
         smiles = Chem.MolToSmiles(combined, isomericSmiles=True)
         return smiles, status
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Assembly sanitization failed: %s. Falling back to dot-joined fragments.", exc)
+        logger.warning("assembly sanitization failed %s fallback punktverknuepfte fragmente", exc)
         fallback = ".".join(smiles_list)
         return fallback, "failed"
 
@@ -700,10 +657,11 @@ class JTVAE(nn.Module):
         fragment_idx_to_smiles=None,
         device=None,
         assemble_kwargs: Optional[Dict] = None,
+        temperature: float = 1.0,
     ):
         device_spec = get_device(device)
         target = device_spec.target
-        z = torch.randn(n_samples, self.z_dim, device=target)
+        z = torch.randn(n_samples, self.z_dim, device=target) * float(temperature)
         cond_t = None
         if cond is not None:
             if torch.is_tensor(cond):
@@ -773,9 +731,7 @@ class JTVAE(nn.Module):
             samples.append(beam_result)
         return samples
 
-# -------------------------
 # Loss and training utilities
-# -------------------------
 
 def jtvae_loss(
     frags_logits,
@@ -869,12 +825,15 @@ def train_jtvae(
     kl_weight: float = 0.5,
     property_weight: float = 0.0,
     adj_weight: float = 1.0,
+    scheduler_patience: int = 10,
+    scheduler_factor: float = 0.5,
     use_amp: bool = False,
     compile: bool = False,
     compile_mode: str = "default",
     compile_fullgraph: bool = False,
     max_grad_norm: Optional[float] = None,
     start_epoch: int = 1,
+    cond_stats: Optional[Dict[str, List[float]]] = None,
 ):
     os.makedirs(save_dir, exist_ok=True)
     device_spec = get_device(device)
@@ -931,6 +890,9 @@ def train_jtvae(
         "enabled" if compile_requested else "disabled",
     )
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="min", patience=scheduler_patience, factor=scheduler_factor, min_lr=1e-6
+    )
 
     # dataset should provide precomputed: tree_x, tree_edge_index, graph_x, graph_edge_index, target_frag_idxs, cond
     loader_kwargs = {"batch_size": batch_size, "shuffle": True}
@@ -940,6 +902,13 @@ def train_jtvae(
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled) if amp_enabled else None
     autocast_ctx = torch.cuda.amp.autocast if amp_enabled else contextlib.nullcontext
     start_epoch = max(1, int(start_epoch))
+    best_loss = float("inf")
+    train_smiles: set[str] = set()
+    if hasattr(dataset, "examples"):
+        for ex in getattr(dataset, "examples", []):
+            smi = ex.get("smiles")
+            if smi:
+                train_smiles.add(smi)
     for epoch in range(start_epoch, start_epoch + epochs):
         model.train()
         epoch_loss = 0.0
@@ -1007,8 +976,108 @@ def train_jtvae(
             f"recon={epoch_recon/denom:.4f} kl={epoch_kl/denom:.4f} "
             f"prop={epoch_prop/denom:.4f} adj={epoch_adj/denom:.4f}"
         )
-        torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, f'jtvae_epoch_{epoch}.pt'))
+        scheduler.step(epoch_loss / denom)
+        is_best = epoch_loss < best_loss
+    if is_best:
+        best_loss = epoch_loss
+        torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, 'jtvae_best.pt'))
+    torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, f'jtvae_epoch_{epoch}.pt'))
+    if len(dataset) > 0:
+        val_metrics = _evaluate_jtvae(
+            model,
+            dataset,
+            fragment_vocab,
+            device_spec,
+            cond_stats=cond_stats,
+            train_smiles=train_smiles,
+        )
+        logging.getLogger(__name__).info(
+            "JT-VAE metrics: recon_acc=%.3f prop_mae=%.3f prop_rmse=%.3f validity=%.3f uniqueness=%.3f novelty=%.3f",
+            val_metrics.get("recon_accuracy", 0.0),
+            val_metrics.get("property_mae", 0.0),
+            val_metrics.get("property_rmse", 0.0),
+            val_metrics.get("validity", 0.0),
+            val_metrics.get("uniqueness", 0.0),
+            val_metrics.get("novelty", 0.0),
+        )
     return model
+
+
+def _evaluate_jtvae(
+    model: JTVAE,
+    dataset,
+    fragment_vocab: Dict[int, str],
+    device_spec,
+    *,
+    cond_stats: Optional[Dict[str, List[float]]] = None,
+    train_smiles: Optional[set[str]] = None,
+) -> Dict[str, float]:
+    loader = PyGDataLoader(dataset, batch_size=32, shuffle=False)
+    model.eval()
+    total_correct = 0
+    total_tokens = 0
+    prop_abs = 0.0
+    prop_sq = 0.0
+    prop_count = 0
+    with torch.no_grad():
+        for batch in loader:
+            batch = move_to_device(batch, device_spec)
+            cond = batch.cond if hasattr(batch, "cond") else None
+            target = batch.target_frag_idxs if hasattr(batch, "target_frag_idxs") else None
+            frags_logits, node_feats, adj_logits, mu, logvar, prop_pred = model(
+                batch.tree_x,
+                batch.tree_edge_index,
+                batch.graph_x,
+                batch.graph_edge_index,
+                batch_tree=batch.tree_batch if hasattr(batch, "tree_batch") else None,
+                batch_graph=batch.batch if hasattr(batch, "batch") else None,
+                cond=cond,
+            )
+            if target is not None:
+                mask = target != -1
+                if mask.any():
+                    preds = frags_logits.argmax(dim=-1)
+                    total_correct += (preds[mask] == target[mask]).sum().item()
+                    total_tokens += mask.sum().item()
+            if prop_pred is not None and cond is not None:
+                cond_target = cond
+                prop_abs += torch.abs(prop_pred - cond_target).sum().item()
+                prop_sq += torch.pow(prop_pred - cond_target, 2).sum().item()
+                prop_count += prop_pred.numel()
+    recon_acc = (total_correct / total_tokens) if total_tokens > 0 else 0.0
+    prop_mae = (prop_abs / prop_count) if prop_count > 0 else 0.0
+    prop_rmse = math.sqrt(prop_sq / prop_count) if prop_count > 0 else 0.0
+
+    # Sampling validity/uniqueness/novelty
+    frag_map = fragment_vocab
+    try:
+        samples = sample_conditional(
+            model,
+            frag_map,
+            cond_stats=cond_stats,
+            n_samples=32,
+            assemble_kwargs={"max_tree_nodes": getattr(model, "max_tree_nodes", 12)},
+            device=device_spec.target,
+        )
+    except Exception:
+        samples = []
+    valid_smiles = [s.get("smiles") for s in samples if isinstance(s, dict) and s.get("smiles")]
+    validity = len(valid_smiles) / max(1, len(samples))
+    unique = len(set(valid_smiles))
+    uniqueness = unique / max(1, len(valid_smiles))
+    novelty = 0.0
+    if train_smiles:
+        novel = [s for s in valid_smiles if s not in train_smiles]
+        novelty = len(novel) / max(1, len(valid_smiles))
+
+    return {
+        "recon_accuracy": recon_acc,
+        "property_mae": prop_mae,
+        "property_rmse": prop_rmse,
+        "validity": validity,
+        "uniqueness": uniqueness,
+        "novelty": novelty,
+    }
 
 
 def sample_conditional(
@@ -1016,7 +1085,9 @@ def sample_conditional(
     fragment_vocab: Dict[str, int],
     *,
     cond: Optional[np.ndarray] = None,
+    cond_stats: Optional[Dict[str, List[float]]] = None,
     n_samples: int = 32,
+    temperature: float = 1.0,
     assembler: str = "beam",
     assemble_kwargs: Optional[Dict] = None,
     device: Optional[Union[str, torch.device]] = None,
@@ -1031,6 +1102,9 @@ def sample_conditional(
         Mapping from fragment SMILES to integer indices.
     cond:
         Optional conditioning vector (e.g. normalised properties).
+        If ``cond_stats`` provided, raw values will be normalised using mean/std.
+    cond_stats:
+        Optional dict with keys ``mean`` and ``std`` (from JTPreprocessConfig.condition_stats) to normalise cond.
     n_samples:
         Number of candidate molecules to sample.
     assembler:
@@ -1049,13 +1123,27 @@ def sample_conditional(
     max_tree_nodes = assemble_kwargs.get("max_tree_nodes", 12)
     idx_to_frag = {idx: frag for frag, idx in fragment_vocab.items()}
 
+    cond_norm = None
+    if cond is not None:
+        cond_arr = cond if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
+        cond_arr = np.atleast_2d(cond_arr)
+        if cond_stats and "mean" in cond_stats and "std" in cond_stats:
+            mean = np.asarray(cond_stats["mean"], dtype=np.float32)
+            std = np.asarray(cond_stats["std"], dtype=np.float32)
+            std = np.where(std < 1e-8, 1.0, std)
+            cond_arr = (cond_arr - mean) / std
+        cond_norm = cond_arr.squeeze() if cond_arr.shape[0] > 1 else cond_arr[0]
+        if model.cond_dim and cond_norm.shape[-1] != model.cond_dim:
+            raise ValueError(f"Provided cond dim {cond_norm.shape[-1]} != model cond_dim {model.cond_dim}")
+
     raw_samples = model.sample(
         n_samples=n_samples,
-        cond=cond,
+        cond=cond_norm,
         max_tree_nodes=max_tree_nodes,
         fragment_idx_to_smiles=idx_to_frag,
         assemble_kwargs=assemble_kwargs,
         device=device,
+        temperature=temperature,
     )
 
     formatted: List[Dict[str, str]] = []
@@ -1095,9 +1183,7 @@ def sample_conditional(
         formatted.append(candidate)
     return formatted
 
-# -------------------------
 # Dataset adapter for JT-VAE
-# -------------------------
 class JTData(Data):
     def __inc__(self, key, value, *args, **kwargs):
         if key == "tree_edge_index":
@@ -1163,9 +1249,7 @@ class JTVDataset(torch.utils.data.Dataset):
         data.num_nodes = data.graph_num_nodes
         return data
 
-# -------------------------
 # Quick usage notes
-# -------------------------
 # Preprocessing required:
 # 1) Build fragment vocabulary across dataset -> fragment_idx mapping
 # 2) For each molecule: extract fragments, map to indices -> target_frag_idxs

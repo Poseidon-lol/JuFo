@@ -6,19 +6,26 @@ dataset:
   val_fraction: 0.1
 
 model:
-  hidden_channels: 128
-  num_filters: 128
-  num_interactions: 6
-  num_gaussians: 50
+  hidden_channels: 256
+  num_filters: 256
+  num_interactions: 8
+  num_gaussians: 120
   cutoff: 10.0
   readout: add
+  head_dropout: 0.1
+  interaction_dropout: 0.1
 
 training:
-  n_models: 1
-  epochs: 120
-  batch_size: 16
+  n_models: 3
+  epochs: 240
+  batch_size: 32
   lr: 0.001
   weight_decay: 0.0
-  patience: 16
+  patience: 30
+  scheduler_patience: 20
   device: auto
+  use_amp: true
+  compile: false
+  compile_mode: default
+  compile_fullgraph: false
   save_dir: models/surrogate_3d_full

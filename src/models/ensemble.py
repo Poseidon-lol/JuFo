@@ -1,4 +1,4 @@
-"""Utilities for training and using surrogate model ensembles."""
+"""tools zum trainieren/nutzen von surrogate ensembles"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from torch_geometric.loader import DataLoader as PyGDataLoader
 
-# Ensure the project root (with src/) is on sys.path
+
 import sys
 
 PROJECT_ROOT = Path().resolve()
@@ -38,7 +38,7 @@ MODEL_PATTERN = "mpnn_member_{:02d}.pt"
 
 @dataclass
 class EnsembleConfig:
-    """Configuration options for surrogate ensemble training."""
+    """Configuration optionen für surrogate ensemble training"""
 
     n_models: int = 5
     epochs: int = 120
@@ -79,7 +79,7 @@ class EnsembleConfig:
 
 
 class SurrogateEnsemble:
-    """High-level wrapper around multiple MPNN surrogate models."""
+    """High-level wrapper für multiple MPNN surrogate models"""
 
     def __init__(self, config: EnsembleConfig, *, device: Optional[str | torch.device | DeviceSpec] = None) -> None:
         self.config = config
@@ -98,26 +98,24 @@ class SurrogateEnsemble:
         self._compile_warning_emitted: bool = False
         self._compile_success_logged: bool = False
 
-    # ------------------------------------------------------------------
     # Training
-    # ------------------------------------------------------------------
     def fit(self, train_df, val_df=None) -> None:
-        """Train the ensemble on train_df (and optional val_df)."""
+        """Trainiert den ensemble auf train_df"""
 
         import pandas as pd
 
         if not isinstance(train_df, pd.DataFrame):
-            raise TypeError("train_df must be a pandas DataFrame.")
+            raise TypeError("train_df muss pandas DataFrame sein")
 
         if val_df is not None and not isinstance(val_df, pd.DataFrame):
-            raise TypeError("val_df must be a pandas DataFrame or None.")
+            raise TypeError("val_df muss pandas DataFrame sein")
 
         if train_df.empty:
-            raise ValueError("train_df is empty.")
+            raise ValueError("train_df ist leer.")
 
         target_cols = [c for c in train_df.columns if c not in {"smiles", "id"}]
         if not target_cols:
-            raise ValueError("train_df must contain at least one target column.")
+            raise ValueError("train_df muss mindestens 1 target column haben")
         self.target_columns = tuple(target_cols)
 
         train_dataset = MoleculeDataset(train_df)
@@ -146,7 +144,7 @@ class SurrogateEnsemble:
         amp_enabled = amp_requested and self.device.supports_amp
         if amp_requested and not amp_enabled:
             logger.warning(
-                "AMP requested for surrogate training but device '%s' lacks CUDA support; falling back to FP32.",
+                "amp angefragt fuer surrogate aber device %s ohne cuda fallback fp32",
                 self.device.type,
             )
         compile_requested = bool(getattr(self.config, "compile", False))
@@ -156,14 +154,14 @@ class SurrogateEnsemble:
             f"{self.device.type}:{self.device.index}" if self.device.index is not None else self.device.type
         )
         logger.info(
-            "Surrogate ensemble training on %s (AMP=%s, compile=%s).",
+            "surrogate ensemble training auf %s amp=%s compile=%s",
             device_repr,
-            "enabled" if amp_enabled else "disabled",
-            "enabled" if compile_requested else "disabled",
+            "an" if amp_enabled else "aus",
+            "an" if compile_requested else "aus",
         )
 
         for idx in range(self.config.n_models):
-            logger.info("Training ensemble member %d/%d", idx + 1, self.config.n_models)
+            logger.info("trainiere ensemble member %d/%d", idx + 1, self.config.n_models)
             self._set_all_seeds(base_seed + idx)
 
             model = self._build_model().to(self.device.target)
@@ -222,7 +220,7 @@ class SurrogateEnsemble:
 
                 if epoch % 10 == 0 or epoch == 1:
                     logger.info(
-                        "Member %d epoch %03d train_loss=%.4f val_metric=%.4f lr=%.3e",
+                        "member %d epoch %03d train_loss=%.4f val_metric=%.4f lr=%.3e",
                         idx + 1,
                         epoch,
                         train_loss,
@@ -232,7 +230,7 @@ class SurrogateEnsemble:
 
                 if self.config.patience and epochs_without_improve >= self.config.patience:
                     logger.info(
-                        "Member %d early stopped after %d epochs (best_val=%.4f)",
+                        "member %d early stop nach %d epochen best_val=%.4f",
                         idx + 1,
                         epoch,
                         best_val,
@@ -250,7 +248,7 @@ class SurrogateEnsemble:
             self._member_states.append(best_state)
             self._member_scores.append(best_val)
 
-        logger.info("Finished training %d surrogate members.", len(self._members))
+        logger.info("training fertig fuer %d surrogate modelle", len(self._members))
 
         if val_dataset is not None:
             if self.config.calibrate:
@@ -258,16 +256,14 @@ class SurrogateEnsemble:
             self._metrics = self._evaluate_metrics(val_dataset)
             if self._metrics:
                 logger.info(
-                    "Validation metrics after calibration: %s",
+                    "val metriken nach kalibrierung %s",
                     ", ".join(f"{k}={v:.4f}" for k, v in self._metrics.items()),
                 )
         else:
             self.temperature_ = 1.0
             self._metrics = {}
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
+    # Persistenz
     def save_all(self, *, save_dir: Optional[Path] = None) -> None:
         """Persist ensemble configuration, metadata, and weights."""
 
@@ -281,7 +277,7 @@ class SurrogateEnsemble:
         with config_path.open("w", encoding="utf-8") as fh:
             json.dump(self.config.to_dict(), fh, indent=2)
 
-        # Cast to built-in types for JSON serialisation
+        # Für JSON serialisierung
         meta = {
             "target_columns": list(self.target_columns),
             "node_dim": int(self.node_dim) if self.node_dim is not None else None,
@@ -296,23 +292,23 @@ class SurrogateEnsemble:
             json.dump(meta, fh, indent=2)
 
         if not self._member_states:
-            raise RuntimeError("No trained members to save. Did you call fit()?")
+            raise RuntimeError("Keine trained members da zum save (fit() gecalled??)")
 
         for idx, state in enumerate(self._member_states):
             ckpt_path = target_dir / MODEL_PATTERN.format(idx)
             torch.save(state, ckpt_path)
-            logger.info("Saved ensemble member %d to %s", idx, ckpt_path)
+            logger.info("ensemble member %d gespeichert nach %s", idx, ckpt_path)
 
     @classmethod
     def from_directory(
         cls, directory: Path, *, device: Optional[str | torch.device | DeviceSpec] = None
     ) -> "SurrogateEnsemble":
-        """Load ensemble configuration and weights from a directory."""
+        """Loaded ensemble Konfiguration und gewichte von einer directory"""
 
         directory = Path(directory).resolve()
         config_path = directory / CONFIG_FILENAME
         if not config_path.exists():
-            raise FileNotFoundError(f"Missing ensemble configuration file at {config_path}")
+            raise FileNotFoundError(f"Missing ensemble configuration file bei {config_path}")
 
         with config_path.open("r", encoding="utf-8") as fh:
             cfg_dict = json.load(fh)
@@ -325,9 +321,7 @@ class SurrogateEnsemble:
         ensemble._load_members_from_directory(directory)
         return ensemble
 
-    # ------------------------------------------------------------------
     # Prediction
-    # ------------------------------------------------------------------
     def predict(
         self,
         graphs: Sequence,
@@ -337,14 +331,11 @@ class SurrogateEnsemble:
         mc_dropout_samples: Optional[int] = None,
         temperature: Optional[float] = None,
     ):
-        """Predict mean/std across ensemble for PyG Data objects.
-
-        When ``return_member_predictions`` is ``True`` the third element is the
-        raw predictions with shape ``[n_members, n_passes, n_samples, out_dim]``.
+        """Predicted mean/std fuer ensemble for PyG Data objects.
         """
 
         if not self._members:
-            raise RuntimeError("Surrogate ensemble has no loaded members.")
+            raise RuntimeError("Surrogate ensemble hat keine members geladen. Trainiere oder lade zuerst.")
 
         if not isinstance(graphs, (list, tuple)):
             if hasattr(graphs, "__len__") and hasattr(graphs, "__getitem__"):
@@ -401,9 +392,7 @@ class SurrogateEnsemble:
             return mean, std, member_array
         return mean, std, None
 
-    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------
     def _build_model(self) -> MPModel:
         if self.node_dim is None or self.edge_dim is None or self.out_dim is None:
             raise RuntimeError("Model dimensions unknown. Train the ensemble or load metadata first.")
@@ -429,7 +418,7 @@ class SurrogateEnsemble:
             if major < 7:
                 if not self._compile_warning_emitted:
                     logger.warning(
-                        "torch.compile disabled for surrogate: GPU compute capability %d.%d < 7.0; falling back to eager.",
+                        "torch.compile aus fuer surrogate gpu compute %d.%d < 7.0 fallback eager",
                         major,
                         minor,
                     )
@@ -438,19 +427,19 @@ class SurrogateEnsemble:
         if compile_fn is None:
             if not self._compile_warning_emitted:
                 logger.warning(
-                    "torch.compile requested but not available in this PyTorch build; continuing with eager execution."
+                    "torch.compile angefragt aber in dieser pytorch version nicht da weiter mit eager"
                 )
                 self._compile_warning_emitted = True
             return model
         try:
             compiled = compile_fn(model, mode=mode, fullgraph=fullgraph)
             if not self._compile_success_logged:
-                logger.info("Enabled torch.compile for surrogate training (mode=%s, fullgraph=%s).", mode, fullgraph)
+                logger.info("torch.compile fuer surrogate an mode=%s fullgraph=%s", mode, fullgraph)
                 self._compile_success_logged = True
             return compiled
         except Exception:
             if not self._compile_warning_emitted:
-                logger.exception("torch.compile failed; falling back to eager execution.")
+                logger.exception("torch.compile failed fallback auf eager")
                 self._compile_warning_emitted = True
             return model
 
@@ -527,7 +516,7 @@ class SurrogateEnsemble:
     def _load_metadata(self, directory: Path) -> None:
         meta_path = directory / META_FILENAME
         if not meta_path.exists():
-            logger.warning("No metadata file found at %s. Will attempt to infer dimensions.", meta_path)
+            logger.warning("keine meta datei unter %s versuche dimensionen zu raten", meta_path)
             return
         with meta_path.open("r", encoding="utf-8") as fh:
             meta = json.load(fh)
@@ -563,7 +552,7 @@ class SurrogateEnsemble:
             member.load_state_dict(state)
             member.eval()
             self._members.append(member)
-            logger.info("Loaded ensemble member %d from %s", idx, ckpt)
+            logger.info("ensemble member %d geladen von %s", idx, ckpt)
 
     def _infer_dims_from_state(self, state: Dict[str, torch.Tensor]) -> None:
         if self.node_dim is None and "node_encoder.weight" in state:

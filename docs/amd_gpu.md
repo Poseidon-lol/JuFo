@@ -52,7 +52,7 @@ train_ensemble(df, "models/surrogate", device="cuda:0")
 
 The same parameter is available for:
 - `src/models/ensemble.py::train_ensemble` and `ensemble_predict`
-- `src/models/jtvae_extended.py::train_jtvae`
+- `src/models/jtvae_extended.py::train_jtvae` (supports AMP, compile, grad clipping, LR scheduler)
 - Notebook cells that call these functions (pass `device="directml"`).
 
 ## 3. Known limitations

@@ -1,27 +1,11 @@
-"""
-Data loading helpers for surrogate and generative models.
-
-
-The project works primarily with CSV/Parquet files that contain SMILES rows
-and target properties (HOMO/LUMO, electron affinity, ionisation energy,
-doping metrics, etc.).  This module provides convenient primitives to:
-
-* ingest tabular datasets and ensure consistent column naming
-* compute / store normalisation statistics for target columns
-* perform deterministic train/val/test splits
-* create PyTorch-Geometric compatible dataloaders
-
-The functions are intentionally lightweight and avoid imposing a specific
-framework (PyTorch Lightning, Hydra, ...).  They are used by both the
-surrogate training scripts and the JT-VAE preprocessing pipeline.
-"""
+"""datenhelfer fuer surrogate und generator minimal gehalten"""
 
 from __future__ import annotations
 
 from pathlib import Path
 import sys
 
-# Ensure the project root (with src/) is on sys.path
+# src pfad reinschieben falls noetig
 _THIS_FILE = Path(__file__).resolve()
 _PROJECT_ROOT = None
 for candidate in [_THIS_FILE.parent, *_THIS_FILE.parents]:
@@ -35,7 +19,7 @@ else:
     raise RuntimeError("Could not locate project root containing src/")
 
 if _PROJECT_ROOT is None:
-    # Fallback: assume the parent of the `src` package is the project root.
+    # fallback wenn src erst eins drueber liegt
     for candidate in _THIS_FILE.parents:
         if (candidate / "src").exists():
             _PROJECT_ROOT = candidate
@@ -101,7 +85,7 @@ class TrainValTestSplit:
     test: pd.DataFrame
 
 
-#resolve dataset paths wurde mit chatgpt gemacht weil ich kein bock hatte sowas zu implementieren
+
 def resolve_dataset_path(candidate: Path) -> Path:
     """Resolve dataset paths in bezug zum project root und den common data folders"""
 
@@ -176,7 +160,7 @@ def split_dataframe(
     *,
     val_fraction: float = 0.1, # portion of data for validation set
     test_fraction: float = 0.1, # portion of data for test set
-    seed: int = 42, # random seed for reproducibility
+    seed: int = 42, # random seed fuer reproducibility (wird safe nicht benutzt)
 ) -> TrainValTestSplit:
     """Deterministic random split for train/val/test portions."""
 
@@ -218,13 +202,13 @@ def create_property_dataset(df: pd.DataFrame, *, cache_graphs: bool = False):
         #Hier passiert der Hauptteil: 
 
         #Iteration über jede Zeile im DataFrame
-        #→ row["smiles"] ist ein Molekülstring.
+        # -> row["smiles"] ist ein Molekülstring.
 
         #Zielwerte extrahieren
-       # →  y enthält die Zielgrößen als numpy.float-Array.
+       # -> y enthält die Zielgrößen als numpy.float-Array.
 
         ##Molekül in Graph umwandeln
-        #→ mol_to_graph() ist eine Funktion (aus src.featurization),
+        # -> mol_to_graph() ist eine Funktion (aus src.featurization),
         #die den SMILES-String in ein PyG Data-Objekt umwandelt:
 
         #Knoten = Atome
@@ -236,11 +220,11 @@ def create_property_dataset(df: pd.DataFrame, *, cache_graphs: bool = False):
         #y = Zielwert(e) für das Molekül
 
         #Graph speichern
-        # → Der Graph wird der Liste graphs hinzugefügt.
+        # -> Der Graph wird der Liste graphs hinzugefügt.
 
     if not cache_graphs:
-        # return lazy dataset to avoid storing all Data objects at once
-        from src.models.mpnn import MoleculeDataset  # local import to avoid circular on module load
+        # return lazy dataset um nicht alle Data objects aufeinaml zu speichern
+        from src.models.mpnn import MoleculeDataset  # local import um  circular on module load zu vermeiden
 
         return MoleculeDataset(df)
     return graphs
@@ -253,10 +237,10 @@ def build_pyg_dataloaders(
     num_workers: int = 0,
     shuffle_train: bool = True,
 ) -> Dict[str, torch.utils.data.DataLoader]:
-    """Create PyG dataloaders for train/val/test splits."""
+    """Createt PyG dataloaders für train/val/test splits"""
 
     if PyGDataLoader is None:
-        raise ImportError("torch_geometric is required to build graph dataloaders.")
+        raise ImportError("torch_geometric brauicht man für build graph dataloaders")
 
     train_ds = create_property_dataset(split.train)
     val_ds = create_property_dataset(split.val)

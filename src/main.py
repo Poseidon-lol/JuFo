@@ -105,6 +105,8 @@ def train_surrogate_3d(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     if getattr(args, "device", None):
         cfg.training.device = args.device
+    if getattr(args, "amp", None) is not None:
+        cfg.training.use_amp = bool(args.amp)
     data_cfg = cfg.dataset
     df = pd.read_csv(data_cfg.path)
     target_columns = list(getattr(data_cfg, "target_columns", []))
@@ -144,6 +146,7 @@ def train_surrogate_3d(args: argparse.Namespace) -> None:
 def train_surrogate_3d_full(args: argparse.Namespace) -> None:
     """Train a full SchNet (PyG) surrogate on MolBlock geometries."""
     import pandas as pd
+    import numpy as np
     from src.data.featurization_3d import dataframe_to_3d_dataset
     from src.models.schnet_full import RealSchNetConfig, train_schnet_full
 
@@ -162,9 +165,13 @@ def train_surrogate_3d_full(args: argparse.Namespace) -> None:
         raise ValueError("No valid 3D entries parsed from dataset; check mol_column/smiles_column.")
     # split
     val_fraction = float(getattr(data_cfg, "val_fraction", 0.1))
+    seed = int(getattr(cfg.training, "seed", 1337))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(ds))
     n_val = int(len(ds) * val_fraction)
-    train_ds = ds[n_val:]
-    val_ds = ds[:n_val] if n_val > 0 else None
+    val_idx = set(perm[:n_val].tolist())
+    train_ds = [ds[i] for i in perm if i not in val_idx]
+    val_ds = [ds[i] for i in val_idx] if n_val > 0 else None
     train_cfg = cfg.training
     model_cfg = cfg.model
     sch_cfg = RealSchNetConfig(
@@ -177,8 +184,17 @@ def train_surrogate_3d_full(args: argparse.Namespace) -> None:
         lr=train_cfg.lr,
         weight_decay=train_cfg.weight_decay,
         batch_size=train_cfg.batch_size,
+        num_workers=getattr(train_cfg, "num_workers", RealSchNetConfig.num_workers),
+        pin_memory=getattr(train_cfg, "pin_memory", False),
         epochs=train_cfg.epochs,
         patience=train_cfg.patience,
+        scheduler_patience=getattr(train_cfg, "scheduler_patience", getattr(train_cfg, "patience", 10)),
+        use_amp=bool(getattr(train_cfg, "use_amp", False)),
+        grad_clip=float(getattr(train_cfg, "grad_clip", 0.0)),
+        loss=getattr(train_cfg, "loss", "l1"),
+        target_weights=getattr(train_cfg, "target_weights", None),
+        head_dropout=getattr(model_cfg, "head_dropout", 0.0),
+        interaction_dropout=getattr(model_cfg, "interaction_dropout", 0.0),
         device=getattr(train_cfg, "device", "cpu"),
         save_dir=Path(train_cfg.save_dir),
     )
@@ -343,6 +359,8 @@ def train_generator(args: argparse.Namespace) -> None:
     compile_mode = getattr(cfg.training, "compile_mode", "default")
     compile_fullgraph = bool(getattr(cfg.training, "compile_fullgraph", False))
     max_grad_norm = getattr(cfg.training, "max_grad_norm", None)
+    scheduler_patience = int(getattr(cfg.training, "scheduler_patience", 10))
+    scheduler_factor = float(getattr(cfg.training, "scheduler_factor", 0.5))
     resume_epoch = getattr(cfg.training, "resume_epoch", None)
     if resume_epoch is None and resume_ckpt:
         match = re.search(r"epoch_(\d+)", str(resume_ckpt))
@@ -377,12 +395,15 @@ def train_generator(args: argparse.Namespace) -> None:
         kl_weight=kl_weight,
         property_weight=property_weight,
         adj_weight=adjacency_weight,
+        scheduler_patience=scheduler_patience,
+        scheduler_factor=scheduler_factor,
         use_amp=use_amp,
         compile=compile_flag,
         compile_mode=compile_mode,
         compile_fullgraph=compile_fullgraph,
         max_grad_norm=max_grad_norm,
         start_epoch=start_epoch,
+        cond_stats=jt_config.condition_stats,
     )
     vocab_path = Path(cfg.save_dir) / "fragment_vocab.json"
     vocab_path.parent.mkdir(parents=True, exist_ok=True)
@@ -527,20 +548,30 @@ def run_active_loop(args: argparse.Namespace) -> None:
             self.batch_size = cfg.loop.batch_size
             self.is_schnet = True
             self.train_params = train_params or {}
+            self.mc_samples_default = int(self.train_params.get("mc_samples", 0))
 
             # move models to device
             moved = []
             for m in self.models:
                 moved.append(m.to(self.device))
             self.models = moved
+            if self.mc_samples_default <= 0 and self.models:
+                base_cfg = getattr(self.models[0], "cfg", None)
+                if base_cfg and (
+                    getattr(base_cfg, "head_dropout", 0.0) > 0 or getattr(base_cfg, "interaction_dropout", 0.0) > 0
+                ):
+                    self.mc_samples_default = 5
 
-        def predict(self, graphs, batch_size=None, mc_samples: int = 1, **kwargs):
+        def predict(self, graphs, batch_size=None, mc_samples: int | None = None, **kwargs):
             import numpy as np
 
             if not isinstance(graphs, (list, tuple)):
                 graphs = [graphs]
             loader = DataLoader(graphs, batch_size=batch_size or self.batch_size, shuffle=False)
-            mc = max(1, int(mc_samples))
+            mc = mc_samples
+            if mc is None:
+                mc = self.mc_samples_default
+            mc = max(1, int(mc))
             all_passes = []
             for model in self.models:
                 is_training = model.training
@@ -599,6 +630,17 @@ def run_active_loop(args: argparse.Namespace) -> None:
                         "batch_size": self.train_params.get("batch_size", 16),
                         "epochs": self.train_params.get("epochs", 30),
                         "patience": self.train_params.get("patience", 5),
+                        "scheduler_patience": self.train_params.get(
+                            "scheduler_patience", getattr(base_cfg, "scheduler_patience", 10)
+                        ),
+                        "use_amp": bool(self.train_params.get("use_amp", getattr(base_cfg, "use_amp", False))),
+                        "grad_clip": float(self.train_params.get("grad_clip", getattr(base_cfg, "grad_clip", 0.0))),
+                        "loss": self.train_params.get("loss", getattr(base_cfg, "loss", "l1")),
+                        "target_weights": self.train_params.get("target_weights", getattr(base_cfg, "target_weights", None)),
+                        "head_dropout": float(self.train_params.get("head_dropout", getattr(base_cfg, "head_dropout", 0.0))),
+                        "interaction_dropout": float(self.train_params.get("interaction_dropout", getattr(base_cfg, "interaction_dropout", 0.0))),
+                        "num_workers": int(self.train_params.get("num_workers", getattr(base_cfg, "num_workers", 0))),
+                        "pin_memory": bool(self.train_params.get("pin_memory", getattr(base_cfg, "pin_memory", False))),
                         "device": str(self.device),
                         "save_dir": Path(self.train_params.get("save_dir", getattr(base_cfg, "save_dir", "models/surrogate_3d_full"))),
                     }
@@ -919,6 +961,12 @@ def main() -> None:
         default=None,
         help="Device for full SchNet surrogate training (e.g., 'auto', 'cuda', 'cpu'). Overrides config.",
     )
+    train3d_full_parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable AMP mixed precision for full SchNet (default: config).",
+    )
 
     gen_parser = subparsers.add_parser("train-generator")
     gen_parser.add_argument("--config", default="configs/gen_conf.yaml")
@@ -965,6 +1013,7 @@ def main() -> None:
     al_parser.add_argument("--generator-ckpt", default=None)
     al_parser.add_argument("--generator-3d-ckpt", default=None)
     al_parser.add_argument("--iterations", type=int, default=5)
+    al_parser.add_argument("--seed", type=int, default=None)
     al_parser.add_argument("--use-pseudo-dft", action="store_true")
     al_parser.add_argument(
         "--device",
