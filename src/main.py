@@ -852,6 +852,7 @@ def run_active_loop(args: argparse.Namespace) -> None:
                 "store_metadata": pipeline_data.get("store_metadata", defaults.store_metadata),
                 "allow_fallback": pipeline_data.get("allow_fallback", defaults.allow_fallback),
                 "tracked_properties": tuple(pipeline_data.get("tracked_properties", defaults.tracked_properties)),
+                "walltime_limit": pipeline_data.get("walltime_limit", defaults.walltime_limit),
             }
             pipeline_config = PipelineConfig(**pipeline_kwargs)
             if hasattr(qc_cfg, "engine"):

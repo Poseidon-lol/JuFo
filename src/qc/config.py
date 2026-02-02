@@ -15,6 +15,12 @@ class GeometryConfig:
     random_seed: Optional[int] = 42
     optimize: bool = True
     use_etkdg: bool = True
+    conformers: int = 10
+    refine_forcefield: str = "MMFF94"
+    final_opt_forcefield: str = "MMFF94"
+    final_opt_iterations: int = 200
+    rms_force_thresh: float = 0.5
+    pick_lowest_energy: bool = True
 
 
 @dataclass
@@ -31,6 +37,7 @@ class QuantumTaskConfig:
     charge: int = 0
     multiplicity: int = 1
     solvent_model: Optional[str] = None
+    solvent: Optional[str] = None
     keywords: Mapping[str, Any] = field(default_factory=dict)
     scratch_dir: Path = Path("qc_runs")
     walltime_limit: Optional[int] = None  # seconds
@@ -49,6 +56,7 @@ class PipelineConfig:
     cleanup_workdir: bool = False
     store_metadata: bool = True
     allow_fallback: bool = True
+    walltime_limit: Optional[int] = None  # seconds for per-job timeout
     tracked_properties: Sequence[str] = (
         "HOMO",
         "LUMO",

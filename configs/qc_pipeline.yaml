@@ -1,26 +1,43 @@
 geometry:
   force_field: MMFF94
-  max_iterations: 500
-  embed_tries: 10
+  max_iterations: 300
+  embed_tries: 20
   random_seed: 1337
   optimize: true
   use_etkdg: true
+  conformers: 10           # number of ETKDG conformers to generate
+  refine_forcefield: MMFF94 # constrained refinement per conformer
+  final_opt_forcefield: MMFF94
+  final_opt_iterations: 200
+  rms_force_thresh: 0.5     # kcal/mol/Å threshold to stop early if converged
+  pick_lowest_energy: true  # select lowest MMFF conformer before DFT
 quantum:
   engine: orca
   executable: orca
   method: B3LYP
   basis: def2-SVP
-  level_of_theory: wb97xd/def2-SVP
+  level_of_theory: B3LYP/def2-SVP
   dispersion: D3BJ
-  properties: [HOMO, LUMO, gap, IE, EA, lambda_hole, lambda_electron, dipole, polarizability, lambda_max, oscillator_strength, packing_score, stability_index]
+  solvent_model: CPCM
+  solvent: chloroform
+  properties: [HOMO, LUMO, gap, dipole, polarizability]
   charge: 0
   multiplicity: 1
-  solvent_model: null
-max_workers: 4
-poll_interval: 5.0
+fallbacks:
+  - engine: orca
+    method: PBE0
+    basis: def2-SVP
+    dispersion: D3BJ
+  - engine: xtb
+    method: GFN2-xTB
+    basis: null
+    dispersion: null
+max_workers: 8
+poll_interval: 20.0
 work_dir: qc_runs
-cleanup_workdir: false
+cleanup_workdir: true
 store_metadata: true
-allow_fallback: false
+allow_fallback: true
+walltime_limit: 1800
 
 

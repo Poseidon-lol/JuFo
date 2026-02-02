@@ -195,6 +195,11 @@ class OrcaExecutor(ExternalProgramExecutor):
 
     def _write_input(self, path: Path, geometry: GeometryResult, task: QuantumTaskConfig) -> None:
         keywords = [task.method, task.basis, "TightSCF"]
+        if task.solvent_model:
+            if task.solvent:
+                keywords.append(f"{task.solvent_model}({task.solvent})")
+            else:
+                keywords.append(task.solvent_model)
         use_tddft = any(
             p.lower().startswith("lambda")
             or p.lower().startswith("absorption")

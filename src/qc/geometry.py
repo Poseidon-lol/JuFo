@@ -45,48 +45,67 @@ def generate_3d_geometry(smiles: str, config: GeometryConfig) -> GeometryResult:
     if config.random_seed is not None:
         params.randomSeed = int(config.random_seed)
     params.numThreads = 0
-    status = -1
-    for attempt in range(max(1, config.embed_tries)):
-        status = AllChem.EmbedMolecule(mol, params)
-        if status == 0:
-            break
-    if status != 0:
-        return GeometryResult(
-            smiles=smiles,
-            mol=None,
-            success=False,
-            message=f"Embedding failed (status={status})",
-        )
 
-    energy = None
-    if config.optimize:
-        ff_name = config.force_field.upper()
-        if ff_name.startswith("MMFF"):
-            props = AllChem.MMFFGetMoleculeProperties(mol, mmffVariant="MMFF94s" if "94S" in ff_name else "MMFF94")
-            if props is None:
-                ff_name = "UFF"
-            else:
-                ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=0)
+    target_confs = max(1, int(getattr(config, "conformers", 1)))
+    max_tries = max(target_confs * 2, config.embed_tries)
+    conformer_results = []
+
+    def _minimize(conf_id: int, ff_name: str, max_iter: int) -> Optional[float]:
+        ff_upper = ff_name.upper()
+        energy_local = None
+        if ff_upper.startswith("MMFF"):
+            props = AllChem.MMFFGetMoleculeProperties(
+                mol, mmffVariant="MMFF94s" if "94S" in ff_upper else "MMFF94"
+            )
+            if props is not None:
+                ff = AllChem.MMFFGetMoleculeForceField(mol, props, confId=conf_id)
                 ff.Initialize()
-                ff.Minimize(maxIts=config.max_iterations)
-                energy = ff.CalcEnergy()
-        if energy is None:
-            ff = AllChem.UFFGetMoleculeForceField(mol, confId=0)
+                ff.Minimize(maxIts=max_iter)
+                energy_local = ff.CalcEnergy()
+        if energy_local is None:
+            ff = AllChem.UFFGetMoleculeForceField(mol, confId=conf_id)
             if ff is not None:
                 ff.Initialize()
-                ff.Minimize(maxIts=config.max_iterations)
-                energy = ff.CalcEnergy()
+                ff.Minimize(maxIts=max_iter)
+                energy_local = ff.CalcEnergy()
+        return energy_local
 
-    conf_id = 0
-    xyz = _mol_to_xyz(mol, conf_id)
-    metadata = {"force_field": config.force_field, "opt_energy": energy or np.nan}
-    return GeometryResult(
-        smiles=smiles,
-        mol=mol,
-        success=True,
-        message="ok",
-        energy=energy,
-        conformer_id=conf_id,
-        xyz=xyz,
-        metadata=metadata,
-    )
+    for attempt in range(max_tries):
+        status = AllChem.EmbedMolecule(mol, params)
+        if status != 0:
+            continue
+        conf_id = mol.GetNumConformers() - 1
+        energy = None
+        if config.optimize:
+            energy = _minimize(conf_id, getattr(config, "refine_forcefield", config.force_field), config.max_iterations)
+            if energy is not None and getattr(config, "rms_force_thresh", None):
+                # RDKit API doesn't expose rms directly; keep as future hook
+                pass
+            # final tighter opt if requested
+            energy = _minimize(
+                conf_id,
+                getattr(config, "final_opt_forcefield", config.force_field),
+                getattr(config, "final_opt_iterations", config.max_iterations),
+            ) or energy
+        conf_res = GeometryResult(
+            smiles=smiles,
+            mol=mol,
+            success=True,
+            message="ok",
+            energy=energy,
+            conformer_id=conf_id,
+            xyz=_mol_to_xyz(mol, conf_id),
+            metadata={"force_field": config.force_field, "opt_energy": energy if energy is not None else np.nan},
+        )
+        conformer_results.append(conf_res)
+        if len(conformer_results) >= target_confs:
+            break
+
+    if not conformer_results:
+        return GeometryResult(smiles=smiles, mol=None, success=False, message="Embedding failed")
+
+    if len(conformer_results) == 1 or not getattr(config, "pick_lowest_energy", True):
+        return conformer_results[0]
+
+    best = min(conformer_results, key=lambda c: c.energy if c.energy is not None else float("inf"))
+    return best

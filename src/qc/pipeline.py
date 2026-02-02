@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import hashlib
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, TYPE_CHECKING
@@ -174,6 +175,10 @@ class QCPipeline:
 
         properties = self._post_process(program_result.properties, job)
         metadata = dict(program_result.metadata)
+        smi_hash = hashlib.sha256(job.smiles.encode("utf-8")).hexdigest()
+        xyz_hash = None
+        if geometry and geometry.xyz:
+            xyz_hash = hashlib.sha256(geometry.xyz.encode("utf-8")).hexdigest()
         metadata.update(
             {
                 "geometry_energy": geometry.energy,
@@ -181,8 +186,21 @@ class QCPipeline:
                 "executor": executor.name,
                 "fallback_used": status != "success",
                 "raw_output": program_result.raw_output[:1024] if program_result.raw_output else None,
+                "smiles_hash": smi_hash,
+                "xyz_hash": xyz_hash,
             }
         )
+        validation_error = self._validate_program_result(program_result, job)
+        if validation_error:
+            return QCResult(
+                job=job,
+                properties={},
+                status="error",
+                wall_time=time.time() - start,
+                error_message=validation_error,
+                metadata=metadata,
+                geometry=geometry,
+            )
 
         neutral_energy = metadata.get("total_energy")
         if neutral_energy is not None:
@@ -260,6 +278,23 @@ class QCPipeline:
         if "lambda_electron" not in results:
             results["lambda_electron"] = results["lambda_hole"] + 0.05
         return results
+
+    def _validate_program_result(self, program_result: ProgramResult, job: DFTJobSpec) -> Optional[str]:
+        meta = program_result.metadata or {}
+        if meta.get("scf_converged") is False:
+            return "SCF did not converge"
+        if "charge" in meta and meta["charge"] != job.charge:
+            return f"Charge mismatch (job {job.charge}, result {meta['charge']})"
+        if "multiplicity" in meta and meta["multiplicity"] != job.multiplicity:
+            return f"Multiplicity mismatch (job {job.multiplicity}, result {meta['multiplicity']})"
+        imag = meta.get("imag_frequencies") or meta.get("n_imag") or 0
+        try:
+            imag_count = int(imag)
+        except Exception:
+            imag_count = 0
+        if imag_count > 0:
+            return f"Imaginary frequencies detected ({imag_count})"
+        return None
 
     # ------------------------------------------------------------------
     def _compute_reorganization_energies(
