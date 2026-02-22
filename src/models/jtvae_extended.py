@@ -5,6 +5,11 @@ import math
 import random
 import logging
 import contextlib
+import time
+import io
+import base64
+import html
+import urllib.parse
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -39,6 +44,14 @@ try:
     from rdkit import RDLogger
     from rdkit.Chem import rdMolDescriptors
     try:
+        from rdkit.Chem import Draw
+    except Exception:  # pragma: no cover - optional dependency
+        Draw = None  # type: ignore
+    try:
+        from rdkit.Chem.Draw import rdMolDraw2D
+    except Exception:  # pragma: no cover - optional dependency
+        rdMolDraw2D = None  # type: ignore
+    try:
         from rdkit.Chem import BRICS
         BRICS_AVAILABLE = True
     except Exception:  # pragma: no cover - optional dependency
@@ -47,8 +60,10 @@ try:
     RDKit_AVAILABLE = True
 except Exception:
     RDKit_AVAILABLE = False
+    rdMolDraw2D = None  # type: ignore
 
 from src.utils.device import ensure_state_dict_on_cpu, get_device, move_to_device
+from src.utils.dashboard_server import start_dashboard_server
 
 # Fragmentation utilities (very simplified)
 
@@ -813,10 +828,458 @@ def jtvae_loss(
     return total, recon_loss, kl, property_loss, adj_loss
 
 
+def _smiles_to_data_uri(smiles: str) -> Optional[str]:
+    if not smiles or not RDKit_AVAILABLE:
+        return None
+    with _suppress_rdkit_errors():
+        mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return None
+    if Draw is not None:
+        try:
+            image = Draw.MolToImage(mol, size=(560, 340))
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            payload = base64.b64encode(buffer.getvalue()).decode("ascii")
+            return f"data:image/png;base64,{payload}"
+        except Exception:
+            pass
+    # Fallback: SVG rendering works without Pillow (important for some .venv setups).
+    if rdMolDraw2D is not None:
+        try:
+            drawer = rdMolDraw2D.MolDraw2DSVG(560, 340)
+            rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
+            drawer.FinishDrawing()
+            svg = drawer.GetDrawingText()
+            if not svg:
+                return None
+            encoded = urllib.parse.quote(svg)
+            return f"data:image/svg+xml;utf8,{encoded}"
+        except Exception:
+            return None
+    return None
+
+
+def _build_live_decode_steps(
+    model: JTVAE,
+    fragment_vocab: Dict[str, int],
+    *,
+    device: torch.device,
+    temperature: float = 1.0,
+    topk: int = 5,
+    max_steps: Optional[int] = None,
+    adjacency_threshold: float = 0.5,
+) -> List[Dict[str, object]]:
+    idx_to_frag: Dict[int, str] = {}
+    for frag, idx in fragment_vocab.items():
+        try:
+            idx_to_frag[int(idx)] = str(frag)
+        except Exception:
+            continue
+    if not idx_to_frag:
+        return []
+
+    decoder_max = int(getattr(model, "max_tree_nodes", 12))
+    decode_steps = decoder_max if max_steps is None else int(max_steps)
+    decode_steps = max(1, min(decoder_max, decode_steps))
+    topk = max(1, int(topk))
+
+    z = torch.randn(1, model.z_dim, device=device) * float(temperature)
+    cond_t = None
+    if getattr(model, "cond_dim", 0):
+        cond_t = torch.zeros(1, int(model.cond_dim), device=device)
+    frags_logits, _, adj_logits = model.decoder(z, max_tree_nodes=decode_steps, cond=cond_t)
+    logits = frags_logits[0]
+    adjacency = torch.sigmoid(adj_logits[0]).detach().cpu().numpy()
+
+    picked_fragments: List[str] = []
+    steps: List[Dict[str, object]] = []
+    for node_idx in range(decode_steps):
+        node_logits = logits[node_idx]
+        probs = torch.softmax(node_logits, dim=-1)
+        k = min(topk, int(probs.numel()))
+        top_probs, top_indices = torch.topk(probs, k=k)
+        chosen_idx = int(top_indices[0].item())
+        chosen_frag = idx_to_frag.get(chosen_idx, "")
+        picked_fragments.append(chosen_frag)
+
+        valid_positions = [pos for pos, smi in enumerate(picked_fragments) if smi]
+        adj_subset = None
+        if valid_positions:
+            adj_subset = adjacency[np.ix_(valid_positions, valid_positions)]
+        assembled_smiles, assembled_status = assemble_fragments(
+            picked_fragments,
+            adj_subset,
+            threshold=float(adjacency_threshold),
+        )
+
+        candidates = []
+        for prob, frag_idx in zip(top_probs.tolist(), top_indices.tolist()):
+            frag_idx_i = int(frag_idx)
+            candidates.append(
+                {
+                    "idx": frag_idx_i,
+                    "fragment": idx_to_frag.get(frag_idx_i, ""),
+                    "prob": float(prob),
+                }
+            )
+        steps.append(
+            {
+                "node": node_idx + 1,
+                "picked_idx": chosen_idx,
+                "picked_fragment": chosen_frag,
+                "picked_prob": float(top_probs[0].item()),
+                "candidates": candidates,
+                "fragments": list(picked_fragments),
+                "assembled_smiles": assembled_smiles,
+                "assembled_status": assembled_status,
+            }
+        )
+    return steps
+
+
+def _loss_sparkline(history: List[Dict[str, float]], key: str, *, width: int = 250, height: int = 70) -> str:
+    values = [float(row.get(key, 0.0)) for row in history if key in row]
+    if not values:
+        return "<span class='muted'>n/a</span>"
+    if len(values) == 1:
+        return f"<span>{values[0]:.4f}</span>"
+    vmin = min(values)
+    vmax = max(values)
+    scale = (vmax - vmin) if (vmax - vmin) > 1e-9 else 1.0
+    points = []
+    denom = max(1, len(values) - 1)
+    for idx, value in enumerate(values):
+        x = int(round((idx / denom) * (width - 1)))
+        y = int(round((1.0 - ((value - vmin) / scale)) * (height - 1)))
+        points.append(f"{x},{y}")
+    polyline = " ".join(points)
+    return (
+        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        f"<polyline fill='none' stroke='#10b981' stroke-width='2' points='{polyline}'/>"
+        "</svg>"
+    )
+
+
+def _write_live_decode_dashboard(
+    html_path: Path,
+    *,
+    epoch: int,
+    start_epoch: int,
+    end_epoch: int,
+    current_step: int,
+    steps: List[Dict[str, object]],
+    history: List[Dict[str, float]],
+    refresh_ms: int,
+    started_at: float,
+    exhibition_mode: bool = False,
+    cli_lines: Optional[List[str]] = None,
+) -> None:
+    del exhibition_mode  # layout is intentionally kept simple for display mode
+    current_step = max(0, min(current_step, max(0, len(steps) - 1)))
+    current = steps[current_step] if steps else {}
+    assembled_smiles = str(current.get("assembled_smiles", "") or "")
+    assembled_status = str(current.get("assembled_status", "n/a"))
+    image_uri = _smiles_to_data_uri(assembled_smiles)
+
+    status_map = {
+        "assembled": "zusammengebaut",
+        "single_fragment": "ein Fragment",
+        "partial": "teilweise verbunden",
+        "failed": "fehlgeschlagen",
+        "invalid_smiles": "ungueltige Struktur",
+        "beam_empty": "keine Kandidaten",
+        "no_fragments": "keine Fragmente",
+        "rdkit_unavailable": "RDKit nicht verfuegbar",
+        "fragment_fallback": "Fragment-Fallback",
+        "start": "start",
+        "n/a": "n/a",
+    }
+    status_txt = html.escape(status_map.get(assembled_status, assembled_status))
+
+    step_rows: List[str] = []
+    for idx, step in enumerate(steps):
+        cls = "wartend"
+        if idx < current_step:
+            cls = "fertig"
+        elif idx == current_step:
+            cls = "aktiv"
+        frag = html.escape(str(step.get("picked_fragment", "") or "[leer]"))
+        status_raw = str(step.get("assembled_status", "") or "n/a")
+        status = html.escape(status_map.get(status_raw, status_raw))
+        step_rows.append(
+            f"<li class='{cls}'><strong>Schritt {idx + 1}:</strong> {frag} ({status})</li>"
+        )
+
+    candidate_rows: List[str] = []
+    for cand in current.get("candidates", []) if isinstance(current, dict) else []:
+        fragment = html.escape(str(cand.get("fragment", "") or "[leer]"))
+        prob = max(0.0, min(1.0, float(cand.get("prob", 0.0))))
+        candidate_rows.append(f"<li><span>{fragment}</span><span>{prob:.3f}</span></li>")
+
+    gallery_cards: List[str] = []
+    seen_smiles: set[str] = set()
+    for step in reversed(steps[: current_step + 1]):
+        smi = str(step.get("assembled_smiles", "") or "")
+        if not smi or smi in seen_smiles:
+            continue
+        seen_smiles.add(smi)
+        uri = _smiles_to_data_uri(smi)
+        if not uri:
+            continue
+        st_raw = str(step.get("assembled_status", "") or "n/a")
+        st_txt = html.escape(status_map.get(st_raw, st_raw))
+        node_idx = int(step.get("node", 0) or 0)
+        gallery_cards.append(
+            "<div class='thumb'>"
+            f"<img src='{uri}' alt='Stoff Schritt {node_idx}' />"
+            f"<div class='meta'>Schritt {node_idx} | {st_txt}</div>"
+            "</div>"
+        )
+        if len(gallery_cards) >= 6:
+            break
+
+    cli_render_lines = list(cli_lines[-160:]) if cli_lines else []
+    cli_rows: List[str] = []
+    for line in cli_render_lines:
+        txt = str(line)
+        if len(txt) > 320:
+            txt = txt[:317] + "..."
+        cli_rows.append(f"<div class='cli-line'>{html.escape(txt)}</div>")
+
+    last_epochs = history[-8:]
+    history_rows: List[str] = []
+    for row in last_epochs:
+        history_rows.append(
+            "<tr>"
+            f"<td>{int(row.get('epoch', 0))}</td>"
+            f"<td>{float(row.get('total', 0.0)):.4f}</td>"
+            f"<td>{float(row.get('recon', 0.0)):.4f}</td>"
+            f"<td>{float(row.get('kl', 0.0)):.4f}</td>"
+            f"<td>{float(row.get('prop', 0.0)):.4f}</td>"
+            f"<td>{float(row.get('adj', 0.0)):.4f}</td>"
+            "</tr>"
+        )
+
+    elapsed = max(0, int(time.time() - started_at))
+    elapsed_txt = f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+    refresh_ms = max(200, int(refresh_ms))
+    smiles_txt = html.escape(assembled_smiles or "[ungueltig / leer]")
+    total_epochs = max(1, int(end_epoch) - int(start_epoch) + 1)
+    epoch_progress = max(0.0, min(1.0, (float(epoch) - float(start_epoch) + 1.0) / float(total_epochs)))
+    decode_progress = max(0.0, min(1.0, float(current_step + 1) / float(max(1, len(steps)))))
+
+    html_doc = f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JT-VAE Live-Ansicht</title>
+  <style>
+    body {{
+      margin: 0;
+      padding: 16px;
+      font-family: Arial, sans-serif;
+      background: #f5f6f7;
+      color: #1f2937;
+    }}
+    .wrap {{ max-width: 1400px; margin: 0 auto; }}
+    .layout {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 12px;
+      align-items: start;
+    }}
+    .main-col {{ min-width: 0; }}
+    h1 {{ margin: 0 0 8px; font-size: 1.5rem; }}
+    h2 {{ margin: 0 0 10px; font-size: 1.1rem; }}
+    .info {{ margin-bottom: 12px; color: #4b5563; font-size: 0.95rem; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+    .box {{
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 8px;
+      padding: 12px;
+    }}
+    .mono {{ font-family: Consolas, 'Courier New', monospace; font-size: 0.9rem; word-break: break-all; }}
+    .muted {{ color: #6b7280; }}
+    ul {{ margin: 8px 0 0; padding-left: 18px; }}
+    li {{ margin: 4px 0; }}
+    .kand li {{ display: flex; justify-content: space-between; gap: 8px; }}
+    .aktiv {{ font-weight: 700; }}
+    .progress {{ margin: 6px 0; }}
+    progress {{ width: 100%; height: 16px; }}
+    .thumb-grid {{
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 8px;
+    }}
+    .thumb {{
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      padding: 6px;
+      background: #fff;
+    }}
+    .thumb img {{
+      width: 100%;
+      height: 90px;
+      object-fit: contain;
+      border: 1px solid #f0f2f5;
+      border-radius: 4px;
+      background: #fff;
+    }}
+    .thumb .meta {{
+      margin-top: 4px;
+      font-size: 0.78rem;
+      color: #4b5563;
+    }}
+    .sidebar {{
+      position: sticky;
+      top: 10px;
+      max-height: calc(100vh - 20px);
+      overflow: hidden;
+    }}
+    .cli-log {{
+      margin-top: 8px;
+      border: 1px solid #1f2937;
+      border-radius: 6px;
+      background: #0f172a;
+      color: #d1d5db;
+      font-family: Consolas, 'Courier New', monospace;
+      font-size: 0.82rem;
+      line-height: 1.35;
+      height: calc(100vh - 130px);
+      min-height: 260px;
+      overflow: auto;
+    }}
+    .cli-line {{
+      padding: 5px 8px;
+      border-bottom: 1px solid #1e293b;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
+    th, td {{ border-bottom: 1px solid #e5e7eb; padding: 6px; text-align: left; }}
+    @media (max-width: 1200px) {{
+      .layout {{ grid-template-columns: 1fr; }}
+      .sidebar {{
+        position: static;
+        max-height: none;
+      }}
+      .cli-log {{
+        height: 260px;
+      }}
+    }}
+    @media (max-width: 900px) {{
+      .grid {{ grid-template-columns: 1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="layout">
+      <div class="main-col">
+        <h1>JT-VAE Live-Ansicht</h1>
+        <div class="info">Epoche {epoch}/{end_epoch} | Schritt {current_step + 1}/{max(1, len(steps))} | Laufzeit {elapsed_txt}</div>
+        <div class="progress">
+          <div class="muted">Training-Fortschritt</div>
+          <progress max="100" value="{epoch_progress * 100.0:.1f}"></progress>
+        </div>
+        <div class="progress">
+          <div class="muted">Dekodier-Fortschritt</div>
+          <progress max="100" value="{decode_progress * 100.0:.1f}"></progress>
+        </div>
+
+        <div class="grid">
+          <div class="box">
+            <h2>Aktuelles Molekuel</h2>
+            <div style="margin:8px 0;">
+              {f"<img src='{image_uri}' alt='Molekuel' style='max-width:100%; border:1px solid #d1d5db; border-radius:6px;' />" if image_uri else "<div class='muted'>Noch kein zeichnbares Molekuel.</div>"}
+            </div>
+            <div><strong>Status:</strong> {status_txt}</div>
+            <div class="mono"><strong>SMILES:</strong> {smiles_txt}</div>
+            <h2 style="margin-top:12px;">Top-Fragmente (aktueller Schritt)</h2>
+            <ul class="kand">
+              {"".join(candidate_rows) if candidate_rows else "<li class='muted'>Keine Kandidaten</li>"}
+            </ul>
+            <h2 style="margin-top:12px;">Stoffe (grafische Miniaturen)</h2>
+            <div class="thumb-grid">
+              {"".join(gallery_cards) if gallery_cards else "<div class='muted'>Noch keine Molekuel-Miniaturen.</div>"}
+            </div>
+          </div>
+
+          <div class="box">
+            <h2>Dekodier-Schritte</h2>
+            <ul>
+              {"".join(step_rows) if step_rows else "<li class='muted'>Noch keine Schritte</li>"}
+            </ul>
+          </div>
+        </div>
+
+        <div class="box" style="margin-top:12px;">
+          <h2>Training (letzte Epochen)</h2>
+          <table>
+            <thead><tr><th>Epoche</th><th>Gesamt</th><th>Rekonstruktion</th><th>KL</th><th>Eigenschaft</th><th>Adj</th></tr></thead>
+            <tbody>{"".join(history_rows) if history_rows else "<tr><td colspan='6' class='muted'>Noch keine Werte</td></tr>"}</tbody>
+          </table>
+        </div>
+      </div>
+
+      <aside class="box sidebar">
+        <h2>CLI-Ausgabe</h2>
+        <div class="muted">Letzte {len(cli_render_lines)} Zeilen</div>
+        <div class="cli-log">
+          {"".join(cli_rows) if cli_rows else "<div class='cli-line'>Noch keine CLI-Ausgabe.</div>"}
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <script>
+    setTimeout(function() {{ window.location.reload(); }}, {refresh_ms});
+  </script>
+</body>
+</html>
+"""
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = html_path.with_suffix(".tmp")
+    tmp_path.write_text(html_doc, encoding="utf-8")
+
+    # On Windows, browser/server reads can briefly lock the target file.
+    # Do not crash training because of a transient dashboard write collision.
+    replace_ok = False
+    last_exc: Optional[Exception] = None
+    for _ in range(20):
+        try:
+            tmp_path.replace(html_path)
+            replace_ok = True
+            break
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.05)
+        except Exception as exc:  # pragma: no cover - defensive
+            last_exc = exc
+            break
+
+    if not replace_ok:
+        try:
+            html_path.write_text(html_doc, encoding="utf-8")
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Live decode dashboard update skipped due to file lock: %s", last_exc
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                if tmp_path.exists():
+                    tmp_path.unlink()
+
+
 def train_jtvae(
     model: JTVAE,
     dataset,
-    fragment_vocab: Dict[int, str],
+    fragment_vocab: Dict[str, int],
     device: str = None,
     epochs: int = 100,
     batch_size: int = 16,
@@ -834,18 +1297,33 @@ def train_jtvae(
     max_grad_norm: Optional[float] = None,
     start_epoch: int = 1,
     cond_stats: Optional[Dict[str, List[float]]] = None,
+    live_decode: bool = False,
+    live_decode_path: Optional[Union[str, Path]] = None,
+    live_decode_refresh_ms: int = 1000,
+    live_decode_step_delay: float = 0.0,
+    live_decode_topk: int = 5,
+    live_decode_max_steps: Optional[int] = None,
+    live_decode_temperature: float = 1.0,
+    live_decode_every_n_epochs: int = 1,
+    live_decode_adjacency_threshold: float = 0.5,
+    live_decode_exhibition_mode: bool = False,
+    live_decode_local_view: bool = False,
+    live_decode_host: str = "127.0.0.1",
+    live_decode_port: int = 0,
+    live_decode_open_browser: bool = True,
 ):
     os.makedirs(save_dir, exist_ok=True)
+    logger = logging.getLogger(__name__)
     device_spec = get_device(device)
     if device_spec.type == "directml":
-        logging.getLogger(__name__).warning(
+        logger.warning(
             "DirectML backend lacks required scatter kernels for PyG; falling back to CPU for JT-VAE training."
         )
         device_spec = get_device("cpu")
     amp_requested = bool(use_amp)
     amp_enabled = amp_requested and device_spec.supports_amp
     if amp_requested and not amp_enabled:
-        logging.getLogger(__name__).warning(
+        logger.warning(
             "AMP requested for JT-VAE training but CUDA is unavailable; continuing with full precision."
         )
     model.to(device_spec.target)
@@ -856,7 +1334,7 @@ def train_jtvae(
         except Exception:
             major, minor = (0, 0)
         if major < 7:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "torch.compile disabled for JT-VAE: GPU compute capability %d.%d < 7.0; falling back to eager.",
                 major,
                 minor,
@@ -865,25 +1343,25 @@ def train_jtvae(
     if compile_requested:
         compile_fn = getattr(torch, "compile", None)
         if compile_fn is None:
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "torch.compile requested for JT-VAE but not available in this PyTorch build; using eager execution."
             )
             compile_requested = False
         else:
             try:
                 model = compile_fn(model, mode=compile_mode, fullgraph=compile_fullgraph)
-                logging.getLogger(__name__).info(
+                logger.info(
                     "Enabled torch.compile for JT-VAE (mode=%s, fullgraph=%s).", compile_mode, compile_fullgraph
                 )
             except Exception:
-                logging.getLogger(__name__).exception(
+                logger.exception(
                     "torch.compile failed for JT-VAE; reverting to eager execution."
                 )
                 compile_requested = False
     resolved_device = (
         f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
     )
-    logging.getLogger(__name__).info(
+    logger.info(
         "JT-VAE training on %s (AMP=%s, compile=%s).",
         resolved_device,
         "enabled" if amp_enabled else "disabled",
@@ -901,14 +1379,70 @@ def train_jtvae(
     loader = PyGDataLoader(dataset, **loader_kwargs)
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled) if amp_enabled else None
     autocast_ctx = torch.cuda.amp.autocast if amp_enabled else contextlib.nullcontext
+    epochs = int(epochs)
     start_epoch = max(1, int(start_epoch))
+    if epochs <= 0:
+        logger.warning("JT-VAE training skipped because epochs=%s.", epochs)
+        return model
+    final_epoch = start_epoch + epochs - 1
     best_loss = float("inf")
+    history: List[Dict[str, float]] = []
     train_smiles: set[str] = set()
     if hasattr(dataset, "examples"):
         for ex in getattr(dataset, "examples", []):
             smi = ex.get("smiles")
             if smi:
                 train_smiles.add(smi)
+    live_decode_enabled = bool(live_decode)
+    live_decode_every_n_epochs = max(1, int(live_decode_every_n_epochs))
+    live_decode_refresh_ms = max(200, int(live_decode_refresh_ms))
+    live_decode_step_delay = max(0.0, float(live_decode_step_delay))
+    live_decode_path_resolved: Optional[Path] = None
+    live_dashboard_server = None
+    live_dashboard_url = None
+    live_cli_lines: List[str] = []
+
+    def _append_live_cli(message: str) -> None:
+        if not live_decode_enabled:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        live_cli_lines.append(f"[{timestamp}] {message}")
+        if len(live_cli_lines) > 240:
+            del live_cli_lines[:-240]
+
+    started_at = time.time()
+    if live_decode_enabled:
+        live_decode_path_resolved = Path(live_decode_path) if live_decode_path else (Path(save_dir) / "live_decode_dashboard.html")
+        logger.info("Live decode dashboard enabled: %s", live_decode_path_resolved)
+        _append_live_cli(f"Live-Dashboard aktiv: {live_decode_path_resolved}")
+        _write_live_decode_dashboard(
+            live_decode_path_resolved,
+            epoch=start_epoch,
+            start_epoch=start_epoch,
+            end_epoch=final_epoch,
+            current_step=0,
+            steps=[],
+            history=[],
+            refresh_ms=live_decode_refresh_ms,
+            started_at=started_at,
+            exhibition_mode=bool(live_decode_exhibition_mode),
+            cli_lines=live_cli_lines,
+        )
+        if live_decode_local_view:
+            try:
+                live_dashboard_server, live_dashboard_url = start_dashboard_server(
+                    live_decode_path_resolved,
+                    host=live_decode_host,
+                    port=int(live_decode_port),
+                    open_browser=bool(live_decode_open_browser),
+                    logger=logger,
+                )
+                logger.info("Live decode local view URL: %s", live_dashboard_url)
+                if live_dashboard_url:
+                    _append_live_cli(f"Lokale Ansicht: {live_dashboard_url}")
+            except Exception:
+                logger.exception("Failed to start local live decode server.")
+                _append_live_cli("Fehler: Lokale Ansicht konnte nicht gestartet werden.")
     for epoch in range(start_epoch, start_epoch + epochs):
         model.train()
         epoch_loss = 0.0
@@ -971,17 +1505,105 @@ def train_jtvae(
             epoch_prop += prop_loss.item() * batch.num_graphs
             epoch_adj += adj_loss.item() * batch.num_graphs
         denom = len(dataset) if len(dataset) > 0 else 1
-        print(
-            f"Epoch {epoch:03d} total={epoch_loss/denom:.4f} "
-            f"recon={epoch_recon/denom:.4f} kl={epoch_kl/denom:.4f} "
-            f"prop={epoch_prop/denom:.4f} adj={epoch_adj/denom:.4f}"
+        epoch_total_avg = epoch_loss / denom
+        epoch_recon_avg = epoch_recon / denom
+        epoch_kl_avg = epoch_kl / denom
+        epoch_prop_avg = epoch_prop / denom
+        epoch_adj_avg = epoch_adj / denom
+        history.append(
+            {
+                "epoch": float(epoch),
+                "total": float(epoch_total_avg),
+                "recon": float(epoch_recon_avg),
+                "kl": float(epoch_kl_avg),
+                "prop": float(epoch_prop_avg),
+                "adj": float(epoch_adj_avg),
+            }
         )
-        scheduler.step(epoch_loss / denom)
-        is_best = epoch_loss < best_loss
-    if is_best:
-        best_loss = epoch_loss
-        torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, 'jtvae_best.pt'))
-    torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, f'jtvae_epoch_{epoch}.pt'))
+        epoch_line = (
+            f"Epoch {epoch:03d} total={epoch_total_avg:.4f} "
+            f"recon={epoch_recon_avg:.4f} kl={epoch_kl_avg:.4f} "
+            f"prop={epoch_prop_avg:.4f} adj={epoch_adj_avg:.4f}"
+        )
+        print(epoch_line)
+        _append_live_cli(epoch_line)
+        scheduler.step(epoch_total_avg)
+        is_best = epoch_total_avg < best_loss
+        if is_best:
+            best_loss = epoch_total_avg
+            torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, "jtvae_best.pt"))
+        torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, f"jtvae_epoch_{epoch}.pt"))
+
+        should_update_live_decode = (
+            live_decode_enabled
+            and live_decode_path_resolved is not None
+            and (
+                ((epoch - start_epoch) % live_decode_every_n_epochs == 0)
+                or epoch == final_epoch
+            )
+        )
+        if should_update_live_decode:
+            _append_live_cli(f"Live-Dekodierung fuer Epoche {epoch:03d} wird aktualisiert.")
+            steps: List[Dict[str, object]] = []
+            was_training = model.training
+            model.eval()
+            vis_model = getattr(model, "_orig_mod", model)
+            try:
+                with torch.no_grad():
+                    steps = _build_live_decode_steps(
+                        vis_model,
+                        fragment_vocab,
+                        device=device_spec.target,
+                        temperature=live_decode_temperature,
+                        topk=live_decode_topk,
+                        max_steps=live_decode_max_steps,
+                        adjacency_threshold=live_decode_adjacency_threshold,
+                    )
+            except Exception:
+                logger.exception("Failed to update live decode dashboard at epoch %s.", epoch)
+                _append_live_cli(f"Fehler: Live-Dekodierung in Epoche {epoch:03d} fehlgeschlagen.")
+                steps = []
+            finally:
+                if was_training:
+                    model.train()
+            if not steps:
+                _append_live_cli(f"Hinweis: Keine Dekodier-Schritte fuer Epoche {epoch:03d}.")
+                _write_live_decode_dashboard(
+                    live_decode_path_resolved,
+                    epoch=epoch,
+                    start_epoch=start_epoch,
+                    end_epoch=final_epoch,
+                    current_step=0,
+                    steps=[],
+                    history=history,
+                    refresh_ms=live_decode_refresh_ms,
+                    started_at=started_at,
+                    exhibition_mode=bool(live_decode_exhibition_mode),
+                    cli_lines=live_cli_lines,
+                )
+            else:
+                for step_idx in range(len(steps)):
+                    _write_live_decode_dashboard(
+                        live_decode_path_resolved,
+                        epoch=epoch,
+                        start_epoch=start_epoch,
+                        end_epoch=final_epoch,
+                        current_step=step_idx,
+                        steps=steps,
+                        history=history,
+                        refresh_ms=live_decode_refresh_ms,
+                        started_at=started_at,
+                        exhibition_mode=bool(live_decode_exhibition_mode),
+                        cli_lines=live_cli_lines,
+                    )
+                    if live_decode_step_delay > 0.0 and step_idx + 1 < len(steps):
+                        time.sleep(live_decode_step_delay)
+
+    if live_dashboard_server is not None:
+        # Keep a visible log line near training end so kiosk operators can reconnect quickly.
+        logger.info("Live decode dashboard remained available at %s during training.", live_dashboard_url or "local server")
+        _append_live_cli("Training beendet, lokale Ansicht bleibt erreichbar.")
+
     if len(dataset) > 0:
         val_metrics = _evaluate_jtvae(
             model,
@@ -991,7 +1613,7 @@ def train_jtvae(
             cond_stats=cond_stats,
             train_smiles=train_smiles,
         )
-        logging.getLogger(__name__).info(
+        logger.info(
             "JT-VAE metrics: recon_acc=%.3f prop_mae=%.3f prop_rmse=%.3f validity=%.3f uniqueness=%.3f novelty=%.3f",
             val_metrics.get("recon_accuracy", 0.0),
             val_metrics.get("property_mae", 0.0),
@@ -1006,7 +1628,7 @@ def train_jtvae(
 def _evaluate_jtvae(
     model: JTVAE,
     dataset,
-    fragment_vocab: Dict[int, str],
+    fragment_vocab: Dict[str, int],
     device_spec,
     *,
     cond_stats: Optional[Dict[str, List[float]]] = None,
