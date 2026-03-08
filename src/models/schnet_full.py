@@ -6,6 +6,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Tuple
 import json
+import time
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +15,8 @@ from torch_geometric.nn.models import SchNet as PygSchNet
 from torch.nn.utils import clip_grad_norm_
 
 from src.utils.device import get_device
+from src.utils.dashboard_server import start_dashboard_server
+from src.utils.schnet_dashboard import write_schnet_live_dashboard
 import random
 import numpy as np
 
@@ -44,6 +47,14 @@ class RealSchNetConfig:
     save_dir: Path = Path("models/surrogate_3d_full")
     n_models: int = 1
     seed: int = 1337
+    target_names: Optional[List[str]] = None
+    live_dashboard: bool = False
+    live_dashboard_path: Optional[Path] = None
+    live_dashboard_refresh_ms: int = 900
+    live_dashboard_local_view: bool = False
+    live_dashboard_host: str = "127.0.0.1"
+    live_dashboard_port: int = 0
+    live_dashboard_open_browser: bool = True
 
 
 class RealSchNetModel(torch.nn.Module):
@@ -63,7 +74,16 @@ class RealSchNetModel(torch.nn.Module):
         if cfg.interaction_dropout > 0:
             base.lin1 = torch.nn.Sequential(base.lin1, torch.nn.Dropout(cfg.interaction_dropout))
         # Replace final linear layer to support arbitrary target dimensions.
-        head_in = base.lin1.out_features
+        head_in = getattr(base.lin2, "in_features", None)
+        if head_in is None:
+            head_in = getattr(base.lin1, "out_features", None)
+        if head_in is None and isinstance(base.lin1, torch.nn.Sequential):
+            for layer in reversed(list(base.lin1)):
+                if hasattr(layer, "out_features"):
+                    head_in = int(getattr(layer, "out_features"))
+                    break
+        if head_in is None:
+            raise RuntimeError("Could not infer SchNet head input dimension.")
         if cfg.head_dropout > 0:
             base.lin2 = torch.nn.Sequential(torch.nn.Dropout(cfg.head_dropout), torch.nn.Linear(head_in, out_dim))
         else:
@@ -149,6 +169,52 @@ def train_schnet_full(
     history: List[float] = []
     best_loss = float("inf")
     bad_epochs = 0
+    live_history: List[dict] = []
+    live_lines: List[str] = []
+    live_server = None
+    live_url = None
+    live_enabled = bool(getattr(cfg, "live_dashboard", False))
+    live_path = (
+        Path(cfg.live_dashboard_path)
+        if getattr(cfg, "live_dashboard_path", None)
+        else (cfg.save_dir / "schnet_live_dashboard.html")
+    )
+    live_refresh_ms = max(200, int(getattr(cfg, "live_dashboard_refresh_ms", 900)))
+    started_at = time.time()
+
+    def _append_live(msg: str) -> None:
+        if not live_enabled:
+            return
+        stamp = time.strftime("%H:%M:%S")
+        live_lines.append(f"[{stamp}] {msg}")
+        if len(live_lines) > 240:
+            del live_lines[:-240]
+
+    if live_enabled:
+        write_schnet_live_dashboard(
+            live_path,
+            title="SchNet Full Live Dashboard",
+            epoch=0,
+            total_epochs=cfg.epochs,
+            best_metric=float(best_loss),
+            lr=float(opt.param_groups[0]["lr"]),
+            history=[],
+            refresh_ms=live_refresh_ms,
+            started_at=started_at,
+            target_names=cfg.target_names,
+            cli_lines=live_lines,
+        )
+        if bool(getattr(cfg, "live_dashboard_local_view", False)):
+            try:
+                live_server, live_url = start_dashboard_server(
+                    live_path,
+                    host=str(getattr(cfg, "live_dashboard_host", "127.0.0.1")),
+                    port=int(getattr(cfg, "live_dashboard_port", 0)),
+                    open_browser=bool(getattr(cfg, "live_dashboard_open_browser", True)),
+                )
+                _append_live(f"Local view: {live_url}")
+            except Exception as exc:
+                _append_live(f"Local view failed: {exc}")
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -242,6 +308,7 @@ def train_schnet_full(
             with config_path.open("w", encoding="utf-8") as fh:
                 json.dump(_config_to_dict(cfg), fh, indent=2)
         # lightweight live logging for raw-scale metrics
+        msg = f"[epoch {epoch+1}] train_mae(norm): {train_loss:.4f}"
         if train_metrics and train_metrics.get("mae") is not None:
             train_mae = ", ".join(f"{m:.4f}" for m in train_metrics.get("mae", []))
             val_mae = None
@@ -254,10 +321,43 @@ def train_schnet_full(
                 msg += f" | val_mae(raw): {val_mae}"
             print(msg)
         else:
+            print(msg)
+
+        lr_now = float(opt.param_groups[0]["lr"])
+        live_history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": float(train_loss),
+                "val_loss": None if val_loss is None else float(val_loss),
+                "metric": float(metric),
+                "best": float(best_loss),
+                "lr": lr_now,
+                "train_mae": (train_metrics.get("mae") if train_metrics else None),
+                "val_mae": (val_metrics.get("mae") if val_metrics else None),
+            }
+        )
+        _append_live(msg)
+        if live_enabled:
+            write_schnet_live_dashboard(
+                live_path,
+                title="SchNet Full Live Dashboard",
+                epoch=epoch + 1,
+                total_epochs=cfg.epochs,
+                best_metric=float(best_loss),
+                lr=lr_now,
+                history=live_history,
+                refresh_ms=live_refresh_ms,
+                started_at=started_at,
+                target_names=cfg.target_names,
+                cli_lines=live_lines,
+            )
+        if not (train_metrics and train_metrics.get("mae") is not None):
             bad_epochs += 1
             if bad_epochs >= cfg.patience:
                 break
 
+    if live_server is not None and live_url:
+        _append_live(f"Training done. Dashboard still reachable: {live_url}")
     return model, history
 
 

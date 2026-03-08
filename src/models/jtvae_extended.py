@@ -171,6 +171,7 @@ class GNNLayer(MessagePassing):
 class SimpleGNNEncoder(nn.Module):
     def __init__(self, node_in_dim, hidden_dim=128, n_layers=3):
         super().__init__()
+        n_layers = max(1, int(n_layers))
         self.input_proj = nn.Linear(node_in_dim, hidden_dim)
         self.layers = nn.ModuleList([GNNLayer(hidden_dim, hidden_dim) for _ in range(n_layers)])
 
@@ -190,12 +191,20 @@ class SimpleGNNEncoder(nn.Module):
 class JTEncoder(nn.Module):
     """Encodes both junction tree (fragment-level) and molecular graph into latents."""
 
-    def __init__(self, tree_feat_dim, graph_feat_dim, hidden_dim=128, z_dim=56, cond_dim=0):
+    def __init__(
+        self,
+        tree_feat_dim,
+        graph_feat_dim,
+        hidden_dim=128,
+        z_dim=56,
+        cond_dim=0,
+        gnn_layers: int = 3,
+    ):
         super().__init__()
         # tree-level encoder (fragments as nodes)
-        self.tree_encoder = SimpleGNNEncoder(tree_feat_dim, hidden_dim)
+        self.tree_encoder = SimpleGNNEncoder(tree_feat_dim, hidden_dim, n_layers=gnn_layers)
         # graph-level encoder (full molecule)
-        self.graph_encoder = SimpleGNNEncoder(graph_feat_dim, hidden_dim)
+        self.graph_encoder = SimpleGNNEncoder(graph_feat_dim, hidden_dim, n_layers=gnn_layers)
         # combine
         self.fc_mu = nn.Linear(2 * hidden_dim + cond_dim, z_dim)
         self.fc_logvar = nn.Linear(2 * hidden_dim + cond_dim, z_dim)
@@ -309,7 +318,7 @@ def assemble_fragments(
         with _suppress_rdkit_errors():
             mol = Chem.MolFromSmiles(smi)
         if mol is None:
-            logger.warning("ungueltiges fragment smiles %s beim assembly skippe", smi)
+            logger.debug("ungueltiges fragment smiles %s beim assembly skippe", smi)
             continue
         smiles_list.append(smi)
         mols.append(Chem.Mol(mol))
@@ -422,6 +431,7 @@ def assemble_fragments(
     combined = Chem.Mol(mols[0])
     anchor_indices = [_candidate_attachment_atoms(combined)[0]]
     status = "assembled"
+    failed_connections: List[int] = []
 
     for i in range(1, len(mols)):
         new_mol = mols[i]
@@ -452,11 +462,22 @@ def assemble_fragments(
             if success:
                 break
         if not success:
-            logger.warning("fragment %d laesst sich nicht verbinden bleibt getrennt", i)
+            failed_connections.append(i)
             status = "partial"
             combined = Chem.Mol(combo)
             fallback_anchor = new_candidates[0] if new_candidates else 0
             anchor_indices.append(base_atoms + fallback_anchor)
+
+    if failed_connections:
+        preview = failed_connections[:8]
+        suffix = "..." if len(failed_connections) > len(preview) else ""
+        logger.debug(
+            "assembly partial: %d/%d fragments unconnected (idx=%s%s)",
+            len(failed_connections),
+            max(0, len(mols) - 1),
+            preview,
+            suffix,
+        )
 
     try:
         with _suppress_rdkit_errors():
@@ -464,7 +485,7 @@ def assemble_fragments(
         smiles = Chem.MolToSmiles(combined, isomericSmiles=True)
         return smiles, status
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("assembly sanitization failed %s fallback punktverknuepfte fragmente", exc)
+        logger.debug("assembly sanitization failed %s fallback punktverknuepfte fragmente", exc)
         fallback = ".".join(smiles_list)
         return fallback, "failed"
 
@@ -486,6 +507,7 @@ def beam_search_fragments(
     max_fragment_heavy_atoms: Optional[int] = None,
     max_fragment_length: Optional[int] = None,
     max_total_heavy_atoms: Optional[int] = None,
+    score_partial_assembly: bool = False,
 ) -> Dict[str, object]:
     # logits: [max_nodes, vocab]
     device = logits.device
@@ -537,22 +559,32 @@ def beam_search_fragments(
                 new_indices = beam["indices"] + [idx]
                 new_smiles = beam["smiles"] + ([frag_smiles] if frag_smiles else [""])
                 score_log_prob = beam["log_prob"] + lp
-                valid_positions = [i for i, s in enumerate(new_smiles) if s]
-                adj_subset = None
-                if adjacency is not None and len(valid_positions) > 0:
-                    adj_subset = adjacency[np.ix_(valid_positions, valid_positions)]
-                assembled_smiles, status = assemble_fragments(new_smiles, adj_subset, threshold=threshold)
-                status_score = _score_status(status, penalties)
-                new_beams.append(
-                    {
-                        "indices": new_indices,
-                        "smiles": new_smiles,
-                        "assembled": assembled_smiles,
-                        "status": status,
-                        "log_prob": score_log_prob + status_score,
-                        "heavy_total": heavy_total,
-                    }
-                )
+                if score_partial_assembly:
+                    valid_positions = [i for i, s in enumerate(new_smiles) if s]
+                    adj_subset = None
+                    if adjacency is not None and len(valid_positions) > 0:
+                        adj_subset = adjacency[np.ix_(valid_positions, valid_positions)]
+                    assembled_smiles, status = assemble_fragments(new_smiles, adj_subset, threshold=threshold)
+                    status_score = _score_status(status, penalties)
+                    new_beams.append(
+                        {
+                            "indices": new_indices,
+                            "smiles": new_smiles,
+                            "assembled": assembled_smiles,
+                            "status": status,
+                            "log_prob": score_log_prob + status_score,
+                            "heavy_total": heavy_total,
+                        }
+                    )
+                else:
+                    new_beams.append(
+                        {
+                            "indices": new_indices,
+                            "smiles": new_smiles,
+                            "log_prob": score_log_prob,
+                            "heavy_total": heavy_total,
+                        }
+                    )
         # prune
         new_beams.sort(key=lambda x: x["log_prob"], reverse=True)
         beams = new_beams[:beam_width]
@@ -565,7 +597,36 @@ def beam_search_fragments(
             "fragments": [],
             "score": float("-inf"),
         }
-    best = beams[0]
+
+    # Fast path: only assemble the final beam candidates.
+    best = None
+    best_score = float("-inf")
+    for beam in beams:
+        assembled = beam.get("assembled")
+        status = beam.get("status", "unknown")
+        if assembled is None or (status == "unknown" and not score_partial_assembly):
+            valid_positions = [i for i, s in enumerate(beam["smiles"]) if s]
+            adj_subset = None
+            if adjacency is not None and len(valid_positions) > 0:
+                adj_subset = adjacency[np.ix_(valid_positions, valid_positions)]
+            assembled, status = assemble_fragments(beam["smiles"], adj_subset, threshold=threshold)
+        final_score = float(beam["log_prob"]) + _score_status(str(status), penalties)
+        candidate = dict(beam)
+        candidate["assembled"] = assembled
+        candidate["status"] = status
+        candidate["final_score"] = final_score
+        if final_score > best_score:
+            best_score = final_score
+            best = candidate
+
+    if best is None:
+        return {
+            "smiles": "",
+            "status": "beam_empty",
+            "fragments": [],
+            "score": float("-inf"),
+        }
+
     assembled = best.get("assembled") or ".".join([s for s in best["smiles"] if s])
     status = best.get("status", "unknown")
     if _is_valid_smiles(assembled):
@@ -573,7 +634,7 @@ def beam_search_fragments(
             "smiles": assembled,
             "status": status,
             "fragments": best["smiles"],
-            "score": best["log_prob"],
+            "score": best_score,
         }
     # fallback: choose a valid fragment (longest) if assembly invalid
     valid_frags = [f for f in best["smiles"] if f and _is_valid_smiles(f)]
@@ -584,14 +645,14 @@ def beam_search_fragments(
             "smiles": fallback,
             "status": "fragment_fallback",
             "fragments": valid_frags,
-            "score": best["log_prob"],
+            "score": best_score,
         }
     # mark invalid while keeping fragments for debugging
     return {
         "smiles": "",
         "status": "invalid_smiles",
         "fragments": best["smiles"],
-        "score": best["log_prob"],
+        "score": best_score,
     }
 
 
@@ -605,15 +666,18 @@ class JTVAE(nn.Module):
         hidden_dim=128,
         cond_dim=0,
         max_tree_nodes: int = 12,
+        encoder_layers: int = 3,
     ):
         super().__init__()
         self.max_tree_nodes = max_tree_nodes
+        self.encoder_layers = max(1, int(encoder_layers))
         self.encoder = JTEncoder(
             tree_feat_dim=tree_feat_dim,
             graph_feat_dim=graph_feat_dim,
             hidden_dim=hidden_dim,
             z_dim=z_dim,
             cond_dim=cond_dim,
+            gnn_layers=self.encoder_layers,
         )
         self.decoder = JTDecoder(
             fragment_vocab_size=fragment_vocab_size,
@@ -729,6 +793,7 @@ class JTVAE(nn.Module):
             max_frag_heavy = assemble_kwargs.get("max_fragment_heavy_atoms", None)
             max_frag_len = assemble_kwargs.get("max_fragment_length", None)
             max_total_heavy = assemble_kwargs.get("max_total_heavy_atoms", None)
+            score_partial_assembly = bool(assemble_kwargs.get("score_partial_assembly", False))
 
             beam_result = beam_search_fragments(
                 frags_logits[b],
@@ -742,6 +807,7 @@ class JTVAE(nn.Module):
                 max_fragment_heavy_atoms=max_frag_heavy,
                 max_fragment_length=max_frag_len,
                 max_total_heavy_atoms=max_total_heavy,
+                score_partial_assembly=score_partial_assembly,
             )
             samples.append(beam_result)
         return samples
@@ -902,6 +968,22 @@ def _build_live_decode_steps(
         chosen_idx = int(top_indices[0].item())
         chosen_frag = idx_to_frag.get(chosen_idx, "")
         picked_fragments.append(chosen_frag)
+        edge_scores: List[Dict[str, float]] = []
+        sim_parent: Optional[int] = None
+        sim_parent_score = 0.0
+        if node_idx > 0:
+            row = adjacency[node_idx, :node_idx]
+            if row.size > 0:
+                best_prev = int(np.argmax(row))
+                sim_parent = best_prev + 1
+                sim_parent_score = float(row[best_prev])
+                for prev_idx, score in enumerate(row.tolist()):
+                    edge_scores.append(
+                        {
+                            "to": int(prev_idx + 1),
+                            "score": float(score),
+                        }
+                    )
 
         valid_positions = [pos for pos, smi in enumerate(picked_fragments) if smi]
         adj_subset = None
@@ -931,6 +1013,10 @@ def _build_live_decode_steps(
                 "picked_prob": float(top_probs[0].item()),
                 "candidates": candidates,
                 "fragments": list(picked_fragments),
+                "edge_scores": edge_scores,
+                "sim_parent": sim_parent,
+                "sim_parent_score": sim_parent_score,
+                "adjacency_threshold": float(adjacency_threshold),
                 "assembled_smiles": assembled_smiles,
                 "assembled_status": assembled_status,
             }
@@ -958,6 +1044,199 @@ def _loss_sparkline(history: List[Dict[str, float]], key: str, *, width: int = 2
         f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
         "xmlns='http://www.w3.org/2000/svg'>"
         f"<polyline fill='none' stroke='#10b981' stroke-width='2' points='{polyline}'/>"
+        "</svg>"
+    )
+
+
+def _edge_color(score: float) -> str:
+    ratio = max(0.0, min(1.0, float(score)))
+    start = (148, 163, 184)  # slate
+    end = (16, 185, 129)  # emerald
+    r = int(round(start[0] + (end[0] - start[0]) * ratio))
+    g = int(round(start[1] + (end[1] - start[1]) * ratio))
+    b = int(round(start[2] + (end[2] - start[2]) * ratio))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _render_junction_tree_svg(
+    steps: List[Dict[str, object]],
+    current_step: int,
+    *,
+    threshold: float = 0.5,
+    width: int = 760,
+    height: int = 360,
+) -> str:
+    current_step = max(0, min(current_step, max(0, len(steps) - 1)))
+    n_nodes = min(len(steps), current_step + 1)
+    if n_nodes <= 0:
+        return "<div class='muted'>Noch keine Junction-Tree-Knoten.</div>"
+
+    threshold = max(0.0, min(1.0, float(threshold)))
+    parents: List[Optional[int]] = [None] * n_nodes
+    parent_scores: List[float] = [0.0] * n_nodes
+    extra_edges: List[Tuple[int, int, float]] = []
+
+    for node_idx in range(1, n_nodes):
+        step = steps[node_idx] if node_idx < len(steps) else {}
+        edge_scores_raw = []
+        if isinstance(step, dict):
+            edge_scores_raw = step.get("edge_scores", []) or []
+
+        best_parent = None
+        best_score = -1.0
+        explicit_parent = None
+        explicit_score = None
+
+        if isinstance(step, dict):
+            raw_parent = step.get("sim_parent")
+            if raw_parent is not None:
+                try:
+                    parent_candidate = int(raw_parent) - 1
+                    if 0 <= parent_candidate < node_idx:
+                        explicit_parent = parent_candidate
+                except Exception:
+                    explicit_parent = None
+            raw_parent_score = step.get("sim_parent_score")
+            if raw_parent_score is not None:
+                try:
+                    explicit_score = float(raw_parent_score)
+                except Exception:
+                    explicit_score = None
+
+        if isinstance(edge_scores_raw, list):
+            for edge in edge_scores_raw:
+                if not isinstance(edge, dict):
+                    continue
+                try:
+                    prev_idx = int(edge.get("to", 0)) - 1
+                    score = float(edge.get("score", 0.0))
+                except Exception:
+                    continue
+                if not (0 <= prev_idx < node_idx):
+                    continue
+                if score > best_score:
+                    best_score = score
+                    best_parent = prev_idx
+                if score >= threshold and prev_idx != explicit_parent:
+                    extra_edges.append((node_idx, prev_idx, score))
+                if explicit_parent is not None and prev_idx == explicit_parent:
+                    explicit_score = score
+
+        if explicit_parent is not None:
+            parents[node_idx] = explicit_parent
+            parent_scores[node_idx] = float(explicit_score or 0.0)
+        elif best_parent is not None:
+            parents[node_idx] = best_parent
+            parent_scores[node_idx] = float(best_score)
+        else:
+            parents[node_idx] = node_idx - 1
+            parent_scores[node_idx] = 0.0
+
+    depths = [0] * n_nodes
+    for node_idx in range(1, n_nodes):
+        parent_idx = parents[node_idx]
+        if parent_idx is None:
+            continue
+        depths[node_idx] = max(0, depths[parent_idx] + 1)
+
+    max_depth = max(depths) if depths else 0
+    levels: Dict[int, List[int]] = {}
+    for node_idx, depth in enumerate(depths):
+        levels.setdefault(int(depth), []).append(node_idx)
+
+    margin_x = 34.0
+    margin_y = 36.0
+    usable_w = max(80.0, float(width) - 2.0 * margin_x)
+    usable_h = max(80.0, float(height) - 2.0 * margin_y)
+    positions: Dict[int, Tuple[float, float]] = {}
+    for depth in range(max_depth + 1):
+        row = levels.get(depth, [])
+        if not row:
+            continue
+        y = margin_y + (float(depth) / float(max(1, max_depth))) * usable_h
+        if len(row) == 1:
+            positions[row[0]] = (margin_x + usable_w / 2.0, y)
+            continue
+        for slot, node_idx in enumerate(row):
+            x = margin_x + (float(slot) / float(max(1, len(row) - 1))) * usable_w
+            positions[node_idx] = (x, y)
+
+    edge_elems: List[str] = []
+    for node_idx, prev_idx, score in extra_edges:
+        if node_idx not in positions or prev_idx not in positions:
+            continue
+        x1, y1 = positions[prev_idx]
+        x2, y2 = positions[node_idx]
+        color = _edge_color(score)
+        edge_elems.append(
+            f"<line x1='{x1:.1f}' y1='{y1:.1f}' x2='{x2:.1f}' y2='{y2:.1f}' "
+            f"stroke='{color}' stroke-width='1.2' stroke-opacity='0.26' stroke-dasharray='4 5'/>"
+        )
+
+    for node_idx in range(1, n_nodes):
+        parent_idx = parents[node_idx]
+        if parent_idx is None or node_idx not in positions or parent_idx not in positions:
+            continue
+        score = max(0.0, min(1.0, float(parent_scores[node_idx])))
+        x1, y1 = positions[parent_idx]
+        x2, y2 = positions[node_idx]
+        active = score >= threshold
+        color = _edge_color(score)
+        width_px = 3.0 if active else 1.6
+        dash_attr = "" if active else "stroke-dasharray='6 5'"
+        edge_elems.append(
+            f"<line x1='{x1:.1f}' y1='{y1:.1f}' x2='{x2:.1f}' y2='{y2:.1f}' "
+            f"stroke='{color}' stroke-width='{width_px:.1f}' "
+            f"{dash_attr} />"
+        )
+        lx = (x1 + x2) / 2.0
+        ly = (y1 + y2) / 2.0 - 6.0
+        edge_elems.append(
+            f"<text x='{lx:.1f}' y='{ly:.1f}' text-anchor='middle' "
+            "font-size='11' fill='#334155' font-family='Consolas, \"Courier New\", monospace'>"
+            f"{score:.2f}</text>"
+        )
+
+    node_elems: List[str] = []
+    for node_idx in range(n_nodes):
+        if node_idx not in positions:
+            continue
+        step = steps[node_idx] if node_idx < len(steps) else {}
+        fragment = ""
+        if isinstance(step, dict):
+            fragment = str(step.get("picked_fragment", "") or "")
+        short_fragment = fragment if len(fragment) <= 18 else (fragment[:15] + "...")
+        short_fragment = html.escape(short_fragment or "[leer]")
+        full_fragment = html.escape(fragment or "[leer]")
+
+        x, y = positions[node_idx]
+        is_current = node_idx == current_step
+        is_done = node_idx < current_step
+        fill = "#fef3c7" if is_current else ("#d1fae5" if is_done else "#e5e7eb")
+        stroke = "#92400e" if is_current else "#065f46"
+        radius = 17.0 if is_current else 15.0
+        node_id = node_idx + 1
+        node_elems.append(
+            f"<g><title>Knoten {node_id}: {full_fragment}</title>"
+            f"<circle cx='{x:.1f}' cy='{y:.1f}' r='{radius:.1f}' fill='{fill}' stroke='{stroke}' stroke-width='2' />"
+            f"<text x='{x:.1f}' y='{y + 4.2:.1f}' text-anchor='middle' font-size='12' "
+            "font-weight='700' fill='#111827' font-family='Arial, sans-serif'>"
+            f"{node_id}</text>"
+            f"<text x='{x:.1f}' y='{y + 28.0:.1f}' text-anchor='middle' font-size='11' "
+            "fill='#334155' font-family='Consolas, \"Courier New\", monospace'>"
+            f"{short_fragment}</text></g>"
+        )
+
+    active_edges = sum(1 for node_idx in range(1, n_nodes) if parent_scores[node_idx] >= threshold)
+    return (
+        f"<svg viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg' class='jt-tree-svg' "
+        "role='img' aria-label='Junction Tree Simulation'>"
+        f"<rect x='1' y='1' width='{width - 2}' height='{height - 2}' fill='#f8fafc' stroke='#d1d5db' rx='8'/>"
+        f"{''.join(edge_elems)}"
+        f"{''.join(node_elems)}"
+        f"<text x='16' y='{height - 12}' font-size='11' fill='#475569' "
+        "font-family='Consolas, \"Courier New\", monospace'>"
+        f"Knoten: {n_nodes} | Aktive Kanten >= {threshold:.2f}: {active_edges}</text>"
         "</svg>"
     )
 
@@ -997,6 +1276,28 @@ def _write_live_decode_dashboard(
         "n/a": "n/a",
     }
     status_txt = html.escape(status_map.get(assembled_status, assembled_status))
+    tree_threshold = 0.5
+    if isinstance(current, dict):
+        try:
+            tree_threshold = float(current.get("adjacency_threshold", 0.5))
+        except Exception:
+            tree_threshold = 0.5
+    tree_threshold = max(0.0, min(1.0, tree_threshold))
+    tree_svg = _render_junction_tree_svg(steps, current_step, threshold=tree_threshold)
+    parent_txt = "root"
+    if isinstance(current, dict):
+        raw_parent = current.get("sim_parent")
+        if raw_parent is not None:
+            try:
+                parent_txt = str(int(raw_parent))
+            except Exception:
+                parent_txt = html.escape(str(raw_parent))
+    parent_score = 0.0
+    if isinstance(current, dict):
+        try:
+            parent_score = float(current.get("sim_parent_score", 0.0))
+        except Exception:
+            parent_score = 0.0
 
     step_rows: List[str] = []
     for idx, step in enumerate(steps):
@@ -1135,6 +1436,18 @@ def _write_live_decode_dashboard(
       font-size: 0.78rem;
       color: #4b5563;
     }}
+    .tree-wrap {{
+      margin-top: 8px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 6px;
+      background: #ffffff;
+    }}
+    .jt-tree-svg {{
+      width: 100%;
+      height: auto;
+      display: block;
+    }}
     .sidebar {{
       position: sticky;
       top: 10px;
@@ -1211,7 +1524,12 @@ def _write_live_decode_dashboard(
           </div>
 
           <div class="box">
-            <h2>Dekodier-Schritte</h2>
+            <h2>Junction-Tree Simulation</h2>
+            <div class="muted">Kanten-Schwelle: &gt;= {tree_threshold:.2f} | Parent (aktiver Knoten): {parent_txt} | Score: {parent_score:.2f}</div>
+            <div class="tree-wrap">
+              {tree_svg}
+            </div>
+            <h2 style="margin-top:12px;">Dekodier-Schritte</h2>
             <ul>
               {"".join(step_rows) if step_rows else "<li class='muted'>Noch keine Schritte</li>"}
             </ul>

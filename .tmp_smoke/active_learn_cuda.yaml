@@ -1,0 +1,47 @@
+﻿loop:
+  device: auto
+  batch_size: 2
+  target_columns: [homo, lumo, gap]
+  maximise: [false, true, false]
+  generator_samples: 4
+  generator_attempts: 1
+  results_dir: experiments/smoke_active_cuda
+  diversity_threshold: 0.3
+  property_aliases:
+    HOMO: homo
+    LUMO: lumo
+    gap: gap
+  max_pool_eval: 64
+  predict_batch_size: 32
+  predict_mc_samples: 1
+  auto_relax_filters: true
+  require_conjugation: false
+  require_neutral: false
+  property_filters: {}
+  live_dashboard:
+    enabled: false
+    open_browser: false
+assemble:
+  beam_width: 3
+  topk_per_node: 3
+  adjacency_threshold: 0.45
+  max_tree_nodes: 8
+  score_partial_assembly: false
+acquisition:
+  kind: target
+  beta: 0.0
+  targets: [-5.4, -2.8, 2.0]
+  tolerances: [0.4, 0.5, 0.6]
+  weights: [1.0, 0.8, 1.0]
+  maximise: [false, true, false]
+scheduler:
+  max_iterations: 1
+  surrogate_retrain_every: 0
+  generator_refresh_every: 0
+data:
+  labelled: data/showcase/jtvae_showcase_seed_300.csv
+  pool: data/showcase/jtvae_showcase_6000.csv
+  fragment_vocab: models/smoke/generator_cuda/fragment_vocab.json
+qc:
+  pipeline_config: configs/qc_pipeline.yaml
+  result_store: data/processed/qc_results.csv

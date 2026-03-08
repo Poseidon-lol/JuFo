@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import random
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -351,13 +352,29 @@ class SurrogateEnsemble:
         if dropout_passes is None:
             dropout_passes = self.config.mc_dropout_samples
         n_passes = max(1, int(dropout_passes or 0))
+        n_members = len(self._members)
+        verbose_predict = len(graphs) >= 1000
+        total_batches = max(1, int(math.ceil(len(graphs) / float(effective_batch))))
+        predict_start = time.time()
+        if verbose_predict:
+            logger.info(
+                "surrogate predict start: graphs=%d batch_size=%d members=%d passes=%d batches_per_pass=%d",
+                len(graphs),
+                effective_batch,
+                n_members,
+                n_passes,
+                total_batches,
+            )
 
         all_passes: List[np.ndarray] = []
         member_passes: List[np.ndarray] = [] if return_member_predictions else []
 
-        for member in self._members:
+        for member_idx, member in enumerate(self._members, start=1):
+            if verbose_predict:
+                logger.info("surrogate predict member %d/%d started", member_idx, n_members)
             single_member_passes: List[np.ndarray] = []
             for pass_idx in range(n_passes):
+                pass_start = time.time()
                 use_dropout = n_passes > 1 and getattr(member, "dropout", 0.0) > 0
                 if use_dropout:
                     member.train()
@@ -375,6 +392,15 @@ class SurrogateEnsemble:
                         batch = move_to_device(batch, self.device)
                         preds_batches.append(member(batch).detach().cpu().numpy())
                 single_member_passes.append(np.concatenate(preds_batches, axis=0))
+                if verbose_predict:
+                    logger.info(
+                        "surrogate predict member %d/%d pass %d/%d done in %.1fs",
+                        member_idx,
+                        n_members,
+                        pass_idx + 1,
+                        n_passes,
+                        time.time() - pass_start,
+                    )
             member.eval()
             member_stack = np.stack(single_member_passes, axis=0)
             all_passes.append(member_stack)
@@ -386,6 +412,8 @@ class SurrogateEnsemble:
         std = preds_stack.std(axis=0, ddof=1 if preds_stack.shape[0] > 1 else 0)
         temp_scale = self.temperature_ if temperature is None else temperature
         std = np.clip(std * temp_scale, a_min=1e-6, a_max=None)
+        if verbose_predict:
+            logger.info("surrogate predict finished in %.1fs", time.time() - predict_start)
 
         if return_member_predictions:
             member_array = np.stack(member_passes, axis=0)

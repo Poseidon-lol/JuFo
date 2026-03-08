@@ -1,22 +1,36 @@
 loop:
-  device: auto
+  device: cuda:0
+  surrogate_device: cuda:0
+  generator_device: cuda:0
   batch_size: 4
   target_columns: [homo, lumo, gap]
   maximise: [false, true, false]
-  generator_samples: 32
+  generator_samples: 12
+  generator_attempts: 2
   results_dir: experiments/active_runs
-  diversity_threshold: 0.8
+  diversity_threshold: 0.6
   property_aliases:
     HOMO: homo
     LUMO: lumo
     gap: gap
   max_pool_eval: 5000
+  predict_batch_size: 64
+  predict_mc_samples: 1
   max_generated_heavy_atoms: null
   max_generated_smiles_len: null
   generated_smiles_len_factor: null
   exclude_smiles_paths:
     - experiments/active_runs/active_learning_history.csv
-  auto_relax_filters: false
+  live_dashboard:
+    enabled: true
+    path: experiments/active_runs/active_loop_live_dashboard.html
+    refresh_ms: 1200
+    selected_top_k: 8
+    local_view_enabled: true
+    local_view_host: 127.0.0.1
+    local_view_port: 8773
+    open_browser: true
+  auto_relax_filters: true
   require_conjugation: true
   min_conjugated_bonds: 12
   min_alternating_conjugated_bonds: 6
@@ -42,10 +56,11 @@ loop:
     max_heavy_atoms: null
     save_dir: experiments/generator_refresh
 assemble:
-  beam_width: 6
-  topk_per_node: 6
+  beam_width: 4
+  topk_per_node: 4
   adjacency_threshold: 0.45
-  max_tree_nodes: 16
+  max_tree_nodes: 10
+  score_partial_assembly: false
   max_fragment_heavy_atoms: null
   max_fragment_length: null
   max_total_heavy_atoms: null
@@ -61,9 +76,9 @@ scheduler:
   surrogate_retrain_every: 1
   generator_refresh_every: 0
 data:
-  labelled: data/raw/opv_db.csv
-  pool: data/raw/opv_db.csv
-  fragment_vocab: models/generator_stable/fragment_vocab.json
+  labelled: data/showcase/jtvae_showcase_seed_300.csv
+  pool: data/showcase/jtvae_showcase_6000.csv
+  fragment_vocab: models/generator_showcase/fragment_vocab.json
 qc:
   pipeline_config: configs/qc_pipeline.yaml
   result_store: data/processed/qc_results.csv

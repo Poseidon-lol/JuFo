@@ -124,6 +124,7 @@ def train_surrogate_3d(args: argparse.Namespace) -> None:
     val_ds = ds[:n_val] if n_val > 0 else None
     train_cfg = cfg.training
     model_cfg = cfg.model
+    live_cfg = getattr(train_cfg, "live_dashboard", None)
     sch_cfg = SchNetConfig(
         hidden_channels=model_cfg.hidden_channels,
         num_filters=model_cfg.num_filters,
@@ -138,6 +139,18 @@ def train_surrogate_3d(args: argparse.Namespace) -> None:
         patience=train_cfg.patience,
         device=getattr(train_cfg, "device", "cpu"),
         save_dir=Path(train_cfg.save_dir),
+        target_names=target_columns,
+        live_dashboard=bool(getattr(live_cfg, "enabled", False)) if live_cfg is not None else False,
+        live_dashboard_path=(
+            Path(getattr(live_cfg, "path"))
+            if (live_cfg is not None and getattr(live_cfg, "path", None))
+            else None
+        ),
+        live_dashboard_refresh_ms=int(getattr(live_cfg, "refresh_ms", 900)) if live_cfg is not None else 900,
+        live_dashboard_local_view=bool(getattr(live_cfg, "local_view_enabled", False)) if live_cfg is not None else False,
+        live_dashboard_host=getattr(live_cfg, "local_view_host", "127.0.0.1") if live_cfg is not None else "127.0.0.1",
+        live_dashboard_port=int(getattr(live_cfg, "local_view_port", 0)) if live_cfg is not None else 0,
+        live_dashboard_open_browser=bool(getattr(live_cfg, "open_browser", True)) if live_cfg is not None else True,
     )
     model, hist = train_schnet(train_ds, val_ds, target_dim=len(target_columns), config=sch_cfg)
     print(f"3D surrogate trained; best model saved to {sch_cfg.save_dir/'schnet.pt'}")
@@ -174,6 +187,7 @@ def train_surrogate_3d_full(args: argparse.Namespace) -> None:
     val_ds = [ds[i] for i in val_idx] if n_val > 0 else None
     train_cfg = cfg.training
     model_cfg = cfg.model
+    live_cfg = getattr(train_cfg, "live_dashboard", None)
     sch_cfg = RealSchNetConfig(
         hidden_channels=model_cfg.hidden_channels,
         num_filters=model_cfg.num_filters,
@@ -197,6 +211,18 @@ def train_surrogate_3d_full(args: argparse.Namespace) -> None:
         interaction_dropout=getattr(model_cfg, "interaction_dropout", 0.0),
         device=getattr(train_cfg, "device", "cpu"),
         save_dir=Path(train_cfg.save_dir),
+        target_names=target_columns,
+        live_dashboard=bool(getattr(live_cfg, "enabled", False)) if live_cfg is not None else False,
+        live_dashboard_path=(
+            Path(getattr(live_cfg, "path"))
+            if (live_cfg is not None and getattr(live_cfg, "path", None))
+            else None
+        ),
+        live_dashboard_refresh_ms=int(getattr(live_cfg, "refresh_ms", 900)) if live_cfg is not None else 900,
+        live_dashboard_local_view=bool(getattr(live_cfg, "local_view_enabled", False)) if live_cfg is not None else False,
+        live_dashboard_host=getattr(live_cfg, "local_view_host", "127.0.0.1") if live_cfg is not None else "127.0.0.1",
+        live_dashboard_port=int(getattr(live_cfg, "local_view_port", 0)) if live_cfg is not None else 0,
+        live_dashboard_open_browser=bool(getattr(live_cfg, "open_browser", True)) if live_cfg is not None else True,
     )
     model, hist = train_schnet_full(train_ds, val_ds, target_dim=len(target_columns), config=sch_cfg)
     print(f"Full SchNet surrogate trained; best model saved to {sch_cfg.save_dir/'schnet_full.pt'}")
@@ -227,6 +253,13 @@ def _load_jtvae_from_ckpt(ckpt: Path, fragment_vocab_size: int, cond_dim: int) -
             positional_key = key
             break
     max_tree_nodes = state[positional_key].shape[0] if positional_key else 12
+    encoder_layer_indices = set()
+    pattern = re.compile(r"^encoder\.tree_encoder\.layers\.(\d+)\.")
+    for key in state.keys():
+        match = pattern.match(key)
+        if match:
+            encoder_layer_indices.add(int(match.group(1)))
+    encoder_layers = (max(encoder_layer_indices) + 1) if encoder_layer_indices else 3
     model = JTVAE(
         tree_feat_dim=node_feat_dim,
         graph_feat_dim=graph_feat_dim,
@@ -235,6 +268,7 @@ def _load_jtvae_from_ckpt(ckpt: Path, fragment_vocab_size: int, cond_dim: int) -
         hidden_dim=hidden_dim,
         cond_dim=cond_dim,
         max_tree_nodes=max_tree_nodes,
+        encoder_layers=encoder_layers,
     )
     model.load_state_dict(state)
     return model
@@ -333,6 +367,7 @@ def train_generator(args: argparse.Namespace) -> None:
     tree_feat_dim = examples[0]["tree_x"].size(1)
     graph_feat_dim = examples[0]["graph_x"].size(1)
     logger.info("Tree feature dim: %s | Graph feature dim: %s", tree_feat_dim, graph_feat_dim)
+    encoder_layers = int(getattr(cfg.model, "encoder_layers", 3))
     resume_ckpt = getattr(cfg.training, "resume_ckpt", None)
     if resume_ckpt:
         ckpt_path = Path(resume_ckpt)
@@ -340,6 +375,7 @@ def train_generator(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"JT-VAE resume checkpoint not found: {ckpt_path}")
         logger.info("Loading JT-VAE checkpoint from %s", ckpt_path)
         model = _load_jtvae_from_ckpt(ckpt_path, len(frag2idx), cond_dim_value)
+        logger.info("Loaded JT-VAE from checkpoint (encoder depth inferred from checkpoint).")
     else:
         model = JTVAE(
             tree_feat_dim=tree_feat_dim,
@@ -349,7 +385,9 @@ def train_generator(args: argparse.Namespace) -> None:
             hidden_dim=cfg.model.hidden_dim,
             cond_dim=cond_dim_value,
             max_tree_nodes=cfg.dataset.max_fragments,
+            encoder_layers=encoder_layers,
         )
+        logger.info("Initialized JT-VAE with encoder_layers=%s.", encoder_layers)
     kl_weight = getattr(cfg.training, "kl_weight", 0.5)
     property_weight = getattr(cfg.training, "property_loss_weight", 0.0)
     adjacency_weight = getattr(cfg.training, "adjacency_loss_weight", 1.0)
@@ -361,6 +399,27 @@ def train_generator(args: argparse.Namespace) -> None:
     max_grad_norm = getattr(cfg.training, "max_grad_norm", None)
     scheduler_patience = int(getattr(cfg.training, "scheduler_patience", 10))
     scheduler_factor = float(getattr(cfg.training, "scheduler_factor", 0.5))
+    live_cfg = getattr(cfg.training, "live_decode", None)
+    live_decode_kwargs = {}
+    if live_cfg is not None:
+        live_decode_kwargs = {
+            "live_decode": bool(getattr(live_cfg, "enabled", False)),
+            "live_decode_path": getattr(live_cfg, "path", None),
+            "live_decode_refresh_ms": int(getattr(live_cfg, "refresh_ms", 1000)),
+            "live_decode_step_delay": float(getattr(live_cfg, "step_delay", 0.0)),
+            "live_decode_topk": int(getattr(live_cfg, "topk", 5)),
+            "live_decode_max_steps": getattr(live_cfg, "max_steps", None),
+            "live_decode_temperature": float(getattr(live_cfg, "temperature", 1.0)),
+            "live_decode_every_n_epochs": int(getattr(live_cfg, "every_n_epochs", 1)),
+            "live_decode_adjacency_threshold": float(
+                getattr(live_cfg, "adjacency_threshold", 0.5)
+            ),
+            "live_decode_exhibition_mode": bool(getattr(live_cfg, "exhibition_mode", False)),
+            "live_decode_local_view": bool(getattr(live_cfg, "local_view_enabled", False)),
+            "live_decode_host": getattr(live_cfg, "local_view_host", "127.0.0.1"),
+            "live_decode_port": int(getattr(live_cfg, "local_view_port", 0)),
+            "live_decode_open_browser": bool(getattr(live_cfg, "open_browser", True)),
+        }
     resume_epoch = getattr(cfg.training, "resume_epoch", None)
     if resume_epoch is None and resume_ckpt:
         match = re.search(r"epoch_(\d+)", str(resume_ckpt))
@@ -404,6 +463,7 @@ def train_generator(args: argparse.Namespace) -> None:
         max_grad_norm=max_grad_norm,
         start_epoch=start_epoch,
         cond_stats=jt_config.condition_stats,
+        **live_decode_kwargs,
     )
     vocab_path = Path(cfg.save_dir) / "fragment_vocab.json"
     vocab_path.parent.mkdir(parents=True, exist_ok=True)
@@ -479,6 +539,7 @@ def run_active_loop(args: argparse.Namespace) -> None:
         maximise=tuple(cfg.loop.maximise),
         generator_samples=cfg.loop.generator_samples,
         generator_attempts=int(getattr(cfg.loop, "generator_attempts", LoopConfig.generator_attempts)),
+        seed=(args.seed if getattr(args, "seed", None) is not None else getattr(cfg.loop, "seed", None)),
         results_dir=Path(cfg.loop.results_dir),
         assemble=dict(getattr(cfg, "assemble", {})),
         diversity_threshold=float(getattr(cfg.loop, "diversity_threshold", 0.0)),
@@ -486,6 +547,8 @@ def run_active_loop(args: argparse.Namespace) -> None:
         generator_refresh=dict(getattr(cfg.loop, "generator_refresh", {})),
         property_aliases=dict(getattr(cfg.loop, "property_aliases", {})),
         max_pool_eval=getattr(cfg.loop, "max_pool_eval", None),
+        predict_batch_size=getattr(cfg.loop, "predict_batch_size", None),
+        predict_mc_samples=getattr(cfg.loop, "predict_mc_samples", None),
         max_generated_heavy_atoms=getattr(cfg.loop, "max_generated_heavy_atoms", None),
         max_generated_smiles_len=getattr(cfg.loop, "max_generated_smiles_len", None),
         generated_smiles_len_factor=(
@@ -508,12 +571,21 @@ def run_active_loop(args: argparse.Namespace) -> None:
         ),
         min_aromatic_rings=int(getattr(cfg.loop, "min_aromatic_rings", LoopConfig.min_aromatic_rings)),
         max_rotatable_bonds=getattr(cfg.loop, "max_rotatable_bonds", LoopConfig.max_rotatable_bonds),
+        max_rotatable_bonds_conjugated=getattr(
+            cfg.loop,
+            "max_rotatable_bonds_conjugated",
+            LoopConfig.max_rotatable_bonds_conjugated,
+        ),
         max_branch_points=getattr(cfg.loop, "max_branch_points", None),
+        max_branch_degree=getattr(cfg.loop, "max_branch_degree", None),
+        max_charged_atoms=getattr(cfg.loop, "max_charged_atoms", None),
         property_filters=dict(getattr(cfg.loop, "property_filters", {})),
         require_neutral=bool(getattr(cfg.loop, "require_neutral", True)),
         sa_score_max=getattr(cfg.loop, "sa_score_max", None),
         physchem_filters=dict(getattr(cfg.loop, "physchem_filters", {})),
         scaffold_unique=bool(getattr(cfg.loop, "scaffold_unique", False)),
+        live_dashboard=dict(getattr(cfg.loop, "live_dashboard", {})),
+        auto_relax_filters=bool(getattr(cfg.loop, "auto_relax_filters", LoopConfig.auto_relax_filters)),
     )
 
     labelled = pd.read_csv(cfg.data.labelled)
@@ -730,47 +802,71 @@ def run_active_loop(args: argparse.Namespace) -> None:
     generator3d_template = None
     fragment_vocab: Optional[Dict[str, int]] = None
     generator_device_runtime: Optional[str] = None
-    if args.generator_ckpt and cfg.data.fragment_vocab:
-        vocab_path = Path(cfg.data.fragment_vocab)
-        if vocab_path.exists():
-            with vocab_path.open("r", encoding="utf-8") as f:
-                raw_vocab = json.load(f)
-            if not isinstance(raw_vocab, dict) or not raw_vocab:
-                raise ValueError(f"Fragment vocab at {vocab_path} is empty or not a mapping.")
+    if args.generator_ckpt:
+        ckpt_path = Path(args.generator_ckpt)
+        configured_vocab = Path(cfg.data.fragment_vocab) if getattr(cfg.data, "fragment_vocab", None) else None
+        adjacent_vocab = ckpt_path.parent / "fragment_vocab.json"
+        vocab_candidates = []
+        if adjacent_vocab.exists():
+            vocab_candidates.append(adjacent_vocab)
+        if configured_vocab is not None:
+            vocab_candidates.append(configured_vocab)
 
-            def _intlike(x: object) -> bool:
-                try:
-                    int(x)
-                    return True
-                except Exception:
-                    return False
-
-            sample_key, sample_val = next(iter(raw_vocab.items()))
-            # Case A: frag -> idx mapping (values int-like)
-            if _intlike(sample_val):
-                fragment_vocab = {k: int(v) for k, v in raw_vocab.items()}
-            # Case B: idx -> frag mapping (keys int-like, values strings)
-            elif _intlike(sample_key):
-                fragment_vocab = {v: int(k) for k, v in raw_vocab.items()}
-                logging.getLogger(__name__).info(
-                    "Reversed fragment vocab idx->frag mapping from %s.", vocab_path
-                )
-            else:
-                raise ValueError(f"Unrecognised fragment_vocab format in {vocab_path}")
-        if fragment_vocab:
-            generator = _load_jtvae_from_ckpt(
-                Path(args.generator_ckpt),
-                len(fragment_vocab),
-                cond_dim=len(loop_cfg.target_columns),
+        vocab_path = None
+        for candidate in vocab_candidates:
+            if candidate.exists():
+                vocab_path = candidate
+                break
+        if vocab_path is None:
+            raise FileNotFoundError(
+                "No fragment vocab found for generator checkpoint. "
+                f"Checked: {[str(p) for p in vocab_candidates]}"
             )
-            if generator_device:
-                device_spec = get_device(generator_device)
-                generator = generator.to(device_spec.target)
-                generator_device_runtime = (
-                    f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
-                )
-            else:
-                generator_device_runtime = None
+        if configured_vocab is not None and vocab_path != configured_vocab:
+            logging.getLogger(__name__).info(
+                "Using fragment vocab next to checkpoint (%s) instead of configured path (%s).",
+                vocab_path,
+                configured_vocab,
+            )
+
+        with vocab_path.open("r", encoding="utf-8") as f:
+            raw_vocab = json.load(f)
+        if not isinstance(raw_vocab, dict) or not raw_vocab:
+            raise ValueError(f"Fragment vocab at {vocab_path} is empty or not a mapping.")
+
+        def _intlike(x: object) -> bool:
+            try:
+                int(x)
+                return True
+            except Exception:
+                return False
+
+        sample_key, sample_val = next(iter(raw_vocab.items()))
+        # Case A: frag -> idx mapping (values int-like)
+        if _intlike(sample_val):
+            fragment_vocab = {k: int(v) for k, v in raw_vocab.items()}
+        # Case B: idx -> frag mapping (keys int-like, values strings)
+        elif _intlike(sample_key):
+            fragment_vocab = {v: int(k) for k, v in raw_vocab.items()}
+            logging.getLogger(__name__).info(
+                "Reversed fragment vocab idx->frag mapping from %s.", vocab_path
+            )
+        else:
+            raise ValueError(f"Unrecognised fragment_vocab format in {vocab_path}")
+
+        generator = _load_jtvae_from_ckpt(
+            ckpt_path,
+            len(fragment_vocab),
+            cond_dim=len(loop_cfg.target_columns),
+        )
+        if generator_device:
+            device_spec = get_device(generator_device)
+            generator = generator.to(device_spec.target)
+            generator_device_runtime = (
+                f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
+            )
+        else:
+            generator_device_runtime = None
     if getattr(args, "generator_3d_ckpt", None):
         from src.models.vae3d import VAE3D
         from src.data.featurization_3d_gen import build_gen3d_dataset

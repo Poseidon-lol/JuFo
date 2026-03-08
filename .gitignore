@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 data/
+!src/data/
+!src/data/*.py
 qc_runs/
 qc_runs_smiles.csv
 tmp_*

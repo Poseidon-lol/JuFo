@@ -8,6 +8,7 @@ import contextlib
 from collections import deque
 from pathlib import Path
 import sys
+import time
 
 
 PROJECT_ROOT = Path().resolve()
@@ -35,6 +36,8 @@ from src.data.featurization import mol_to_graph
 from src.data.featurization_3d import molblock_to_data
 from src.models.ensemble import SurrogateEnsemble
 from src.models.jtvae_extended import JTVAE, sample_conditional
+from src.utils.active_loop_dashboard import write_active_loop_dashboard
+from src.utils.dashboard_server import start_dashboard_server
 from src.utils.log import get_logger
 
 try:
@@ -92,6 +95,8 @@ class LoopConfig:
     generator_refresh: Dict[str, object] = field(default_factory=dict)
     property_aliases: Dict[str, str] = field(default_factory=dict)
     max_pool_eval: Optional[int] = None  # cap number von pool candidates evaluated pro iteration
+    predict_batch_size: Optional[int] = None  # optional batch-size override fuer surrogate inference im pool
+    predict_mc_samples: Optional[int] = None  # optional MC-dropout passes fuer surrogate inference
     max_generated_heavy_atoms: Optional[int] = None  # skipt generated SMILES mit zu vielen schweren atome
     max_generated_smiles_len: Optional[int] = None  # skipt generated SMILES mit zu langer Länge
     generated_smiles_len_factor: Optional[float] = 1.5  # fallback length cap als factor von median length wenn max nicht gesetted
@@ -113,6 +118,7 @@ class LoopConfig:
     exclude_smiles_paths: Sequence[str] = tuple()  # optional CSV/TXT files with SMILES to exclude
     auto_relax_filters: bool = True  #falls nichts generated wird, werden alle filter relaxed
     dft_job_defaults: Dict[str, object] = field(default_factory=dict)  # also charge, multiplicity, metadata etc.
+    live_dashboard: Dict[str, object] = field(default_factory=dict)
 
 
 @contextlib.contextmanager
@@ -190,6 +196,19 @@ class ActiveLearningLoop:
         self._filter_pool_overlaps()
         self._median_smiles_len = self._compute_median_smiles_len()
         self._dft_job_defaults: Dict[str, object] = dict(dft_job_defaults or {})
+        self._live_cfg = dict(getattr(config, "live_dashboard", {}) or {})
+        self._live_enabled = bool(self._live_cfg.get("enabled", False))
+        self._live_path = Path(
+            self._live_cfg.get("path", self.results_dir / "active_loop_live_dashboard.html")
+        )
+        self._live_refresh_ms = max(300, int(self._live_cfg.get("refresh_ms", 1200)))
+        self._live_top_k = max(1, int(self._live_cfg.get("selected_top_k", 8)))
+        self._live_lines: List[str] = []
+        self._live_history_rows: List[Dict[str, object]] = []
+        self._live_started_at = time.time()
+        self._live_total_iterations = max(1, int(getattr(self.scheduler.config, "max_iterations", 1)))
+        self._live_server = None
+        self._live_url: Optional[str] = None
         if self.generator is not None:
             self.generator.eval()
             if self.generator_device is None:
@@ -221,6 +240,82 @@ class ActiveLearningLoop:
 
         if len(self.config.target_columns) != len(self.config.maximise):
             raise ValueError("target_columns und maximise length mismatch.")
+        self._init_live_dashboard()
+
+    def _append_live(self, message: str) -> None:
+        if not self._live_enabled:
+            return
+        stamp = time.strftime("%H:%M:%S")
+        self._live_lines.append(f"[{stamp}] {message}")
+        if len(self._live_lines) > 300:
+            del self._live_lines[:-300]
+
+    def _init_live_dashboard(self) -> None:
+        if not self._live_enabled:
+            return
+        self._append_live(f"Active-loop dashboard enabled: {self._live_path}")
+        self._update_live_dashboard(selected=None, generated=0)
+        if bool(self._live_cfg.get("local_view_enabled", False)):
+            try:
+                self._live_server, self._live_url = start_dashboard_server(
+                    self._live_path,
+                    host=str(self._live_cfg.get("local_view_host", "127.0.0.1")),
+                    port=int(self._live_cfg.get("local_view_port", 0)),
+                    open_browser=bool(self._live_cfg.get("open_browser", True)),
+                )
+                if self._live_url:
+                    self._append_live(f"Local view: {self._live_url}")
+            except Exception as exc:
+                logger.exception("Failed to start active-loop local dashboard server.")
+                self._append_live(f"Local view failed: {exc}")
+
+    def _update_live_dashboard(
+        self,
+        *,
+        selected: Optional[pd.DataFrame],
+        generated: int,
+    ) -> None:
+        if not self._live_enabled:
+            return
+        selected_rows: List[Dict[str, object]] = []
+        if selected is not None and not selected.empty:
+            for _, row in selected.head(self._live_top_k).iterrows():
+                predictions: List[Dict[str, object]] = []
+                for target in self.config.target_columns:
+                    predictions.append(
+                        {
+                            "name": target,
+                            "pred": row.get(f"pred_{target}", None),
+                            "std": row.get(f"pred_std_{target}", None),
+                            "label": row.get(target, None),
+                        }
+                    )
+                status = row.get("qc_status", row.get("assembly_status", "selected"))
+                selected_rows.append(
+                    {
+                        "smiles": row.get("smiles", ""),
+                        "acquisition_score": row.get("acquisition_score", None),
+                        "status": status,
+                        "predictions": predictions,
+                    }
+                )
+        try:
+            write_active_loop_dashboard(
+                self._live_path,
+                iteration=int(self.scheduler.iteration),
+                total_iterations=int(self._live_total_iterations),
+                labelled_count=int(len(self.labelled)),
+                pool_count=int(len(self.pool)),
+                generated_last=int(generated),
+                selected_last=0 if selected is None else int(len(selected)),
+                selected_rows=selected_rows,
+                history_rows=list(self._live_history_rows),
+                refresh_ms=self._live_refresh_ms,
+                started_at=self._live_started_at,
+                cli_lines=self._live_lines,
+            )
+        except Exception:
+            logger.exception("Failed updating active-loop live dashboard.")
 
     def _current_best(self) -> Optional[np.ndarray]:
         if self.labelled.empty:
@@ -260,15 +355,73 @@ class ActiveLearningLoop:
         return fp
 
     def _refresh_target_indices(self) -> None:
-        """Aligned desired target columns mit surrogate outputs (handles retrains/ordering)"""
+        """Align desired target columns with surrogate outputs (supports aliases/unit suffixes)."""
         surrogate_targets = list(getattr(self.surrogate, "target_columns", ()))
         if not surrogate_targets:
             raise ValueError("Surrogate keine target_columns defined.")
         self._target_indices = []
-        for t in self.config.target_columns:
-            if t not in surrogate_targets:
-                raise ValueError(f"Target column '{t}' nicht gefudnen in surrogate outputs: {surrogate_targets}")
-            self._target_indices.append(surrogate_targets.index(t))
+        resolved_pairs: List[str] = []
+        for target_name in self.config.target_columns:
+            resolved = self._resolve_surrogate_target(target_name, surrogate_targets)
+            if resolved is None:
+                raise ValueError(
+                    f"Target column '{target_name}' nicht gefunden in surrogate outputs: {surrogate_targets}"
+                )
+            self._target_indices.append(surrogate_targets.index(resolved))
+            resolved_pairs.append(f"{target_name}->{resolved}")
+        logger.info("Active-loop target mapping: %s", ", ".join(resolved_pairs))
+
+    @staticmethod
+    def _norm_property_name(name: str) -> str:
+        key = str(name).strip().lower()
+        if key.endswith("_ev") or key.endswith("_nm"):
+            key = key[:-3]
+        return key
+
+    def _resolve_surrogate_target(self, name: str, surrogate_targets: Sequence[str]) -> Optional[str]:
+        if not surrogate_targets:
+            return None
+        if name in surrogate_targets:
+            return name
+
+        # Direct case-insensitive match.
+        lower_map = {str(col).lower(): str(col) for col in surrogate_targets}
+        direct_ci = lower_map.get(str(name).lower())
+        if direct_ci is not None:
+            return direct_ci
+
+        # Normalized base-name match: e.g. homo -> HOMO_eV.
+        wanted = self._norm_property_name(name)
+        normalized_matches = [
+            str(col) for col in surrogate_targets if self._norm_property_name(str(col)) == wanted
+        ]
+        if len(normalized_matches) == 1:
+            return normalized_matches[0]
+        if normalized_matches:
+            return normalized_matches[0]
+
+        # Alias-based candidates (both directions).
+        inverse_alias = {v: k for k, v in self.property_aliases.items()}
+        alias_candidates: List[str] = []
+        for key in (name, str(name).lower(), str(name).upper(), str(name).capitalize()):
+            mapped = self.property_aliases.get(key)
+            if mapped:
+                alias_candidates.append(str(mapped))
+            inv = inverse_alias.get(key)
+            if inv:
+                alias_candidates.append(str(inv))
+
+        for candidate in alias_candidates:
+            if candidate in surrogate_targets:
+                return candidate
+            ci = lower_map.get(candidate.lower())
+            if ci is not None:
+                return ci
+            cand_norm = self._norm_property_name(candidate)
+            for col in surrogate_targets:
+                if self._norm_property_name(str(col)) == cand_norm:
+                    return str(col)
+        return None
 
     def _parse_smiles(self, smiles: str):
         """Parset SMILES waehrend suppressed RDKit stderr spam auf invalid inputs"""
@@ -285,10 +438,11 @@ class ActiveLearningLoop:
         surrogate_targets = list(getattr(self.surrogate, "target_columns", ()))
         missing = []
         for prop in self.config.property_filters.keys():
-            if prop in surrogate_targets:
-                self._filter_indices[prop] = surrogate_targets.index(prop)
-            else:
+            resolved = self._resolve_surrogate_target(prop, surrogate_targets)
+            if resolved is None:
                 missing.append(prop)
+                continue
+            self._filter_indices[prop] = surrogate_targets.index(resolved)
         if missing:
             logger.warning("property_filters entries nicht da in surrogate outputs und wird ignoriert: %s", missing)
 
@@ -985,6 +1139,34 @@ class ActiveLearningLoop:
                     assemble_kwargs_current.get("max_tree_nodes", 8) or 8, 6
                 )
                 assemble_kwargs_current["beam_width"] = max(assemble_kwargs_current.get("beam_width", 3), 5)
+            if self.pool.empty and self.generator is not None:
+                assemble_kwargs_current = dict(assemble_kwargs_current)
+                base_nodes = int(assemble_kwargs_current.get("max_tree_nodes", 12) or 12)
+                base_beam = int(assemble_kwargs_current.get("beam_width", 5) or 5)
+                base_topk = int(assemble_kwargs_current.get("topk_per_node", 5) or 5)
+                capped_nodes = min(base_nodes, 10)
+                capped_beam = min(base_beam, 4)
+                capped_topk = min(base_topk, 4)
+                if (capped_nodes, capped_beam, capped_topk) != (base_nodes, base_beam, base_topk):
+                    logger.info(
+                        "Pool leer -> fast refill caps: max_tree_nodes=%d, beam_width=%d, topk_per_node=%d",
+                        capped_nodes,
+                        capped_beam,
+                        capped_topk,
+                    )
+                assemble_kwargs_current["max_tree_nodes"] = capped_nodes
+                assemble_kwargs_current["beam_width"] = capped_beam
+                assemble_kwargs_current["topk_per_node"] = capped_topk
+                # Avoid expensive partial assembly scoring in beam search during pool refill.
+                assemble_kwargs_current.setdefault("score_partial_assembly", False)
+            logger.info(
+                "Generator refill attempt %d/%d (pool=%d/%d, n_samples=%d)",
+                attempts,
+                max_attempts,
+                len(self.pool),
+                min_size,
+                int(self.config.generator_samples),
+            )
             samples = []
             if self.generator is not None and self.fragment_vocab:
                 samples = sample_conditional(
@@ -997,6 +1179,7 @@ class ActiveLearningLoop:
                     assemble_kwargs=assemble_kwargs_current,
                     device=self.generator_device,
                 )
+                logger.info("Generator returned %d raw candidates in attempt %d.", len(samples), attempts)
             elif self.generator3d is not None and self.generator3d_template:
                 try:
                     from src.models.vae3d import sample_vae3d
@@ -1257,6 +1440,13 @@ class ActiveLearningLoop:
             use_relaxed = False
             self.pool = pd.concat([self.pool, pd.DataFrame(new_rows)], ignore_index=True)
             generated += len(new_rows)
+            logger.info(
+                "Accepted %d candidates in attempt %d (generated total=%d, pool now=%d).",
+                len(new_rows),
+                attempts,
+                generated,
+                len(self.pool),
+            )
         if len(self.pool) < min_size:
             logger.warning(
                 "Generator sampling exhausted after %d attempt(s): pool size %d (target %d). "
@@ -1302,7 +1492,44 @@ class ActiveLearningLoop:
         return graphs, valid_indices
 
     def _predict_pool(self, graphs: List):
-        mean, std, _ = self.surrogate.predict(graphs, batch_size=self.config.batch_size)
+        predict_batch_size = getattr(self.config, "predict_batch_size", None)
+        if predict_batch_size is None:
+            surrogate_cfg = getattr(self.surrogate, "config", None)
+            predict_batch_size = getattr(surrogate_cfg, "batch_size", None)
+        if predict_batch_size is None:
+            predict_batch_size = self.config.batch_size
+        predict_batch_size = max(1, int(predict_batch_size))
+
+        predict_mc_samples = getattr(self.config, "predict_mc_samples", None)
+        if predict_mc_samples is None:
+            acq_kind = str(getattr(self.config.acquisition, "kind", "")).lower()
+            acq_beta = float(getattr(self.config.acquisition, "beta", 0.0) or 0.0)
+            # Fast-path: target acquisition with beta=0 ignores uncertainty.
+            if acq_kind == "target" and abs(acq_beta) < 1e-12:
+                predict_mc_samples = 1
+        if predict_mc_samples is not None:
+            predict_mc_samples = max(1, int(predict_mc_samples))
+
+        logger.info(
+            "Surrogate inference: evaluating %d graphs (batch_size=%d, mc_samples=%s, model=%s).",
+            len(graphs),
+            predict_batch_size,
+            predict_mc_samples if predict_mc_samples is not None else "default",
+            "schnet-like" if self._is_schnet else "ensemble",
+        )
+        if self._is_schnet:
+            mean, std, _ = self.surrogate.predict(
+                graphs,
+                batch_size=predict_batch_size,
+                mc_samples=predict_mc_samples,
+            )
+        else:
+            mean, std, _ = self.surrogate.predict(
+                graphs,
+                batch_size=predict_batch_size,
+                mc_dropout_samples=predict_mc_samples,
+            )
+        logger.info("Surrogate inference completed: mean shape=%s std shape=%s", mean.shape, std.shape)
         if self._target_indices:
             mean = mean[:, self._target_indices]
             std = std[:, self._target_indices]
@@ -1322,6 +1549,8 @@ class ActiveLearningLoop:
             xi=acq_cfg.xi,
             maximise=acq_cfg.maximise,
             weights=acq_cfg.weights,
+            targets=acq_cfg.targets,
+            tolerances=acq_cfg.tolerances,
         )
         if cfg.kind in {"pareto", "pareto_ucb"}:
             cfg.maximise = [True] * norm_mean.shape[1]
@@ -1436,8 +1665,16 @@ class ActiveLearningLoop:
             graphs = graphs[: self.config.max_pool_eval]
             valid_idx = valid_idx[: self.config.max_pool_eval]
         logger.debug("Featurized %d pool candidates (valid_idx=%d).", len(graphs), len(valid_idx))
+        self._append_live(
+            "iter=%d scoring %d pool candidates"
+            % (int(self.scheduler.iteration + 1), int(len(graphs)))
+        )
 
         mean, std = self._predict_pool(graphs)
+        self._append_live(
+            "iter=%d scoring completed (candidates=%d)"
+            % (int(self.scheduler.iteration + 1), int(len(graphs)))
+        )
         logger.debug("Predictions ready: mean shape %s, std shape %s", mean.shape, std.shape)
         scores = self._score_candidates(mean, std)
         logger.debug("Acquisition scores computed")
@@ -1461,8 +1698,35 @@ class ActiveLearningLoop:
         labelled["iteration"] = self.scheduler.iteration + 1
         self.labelled = pd.concat([self.labelled, labelled], ignore_index=True)
         self.history.append(labelled)
+        best_acq = None
+        mean_acq = None
+        if "acquisition_score" in selected.columns and not selected.empty:
+            with contextlib.suppress(Exception):
+                best_acq = float(selected["acquisition_score"].max())
+            with contextlib.suppress(Exception):
+                mean_acq = float(selected["acquisition_score"].mean())
+        self._live_history_rows.append(
+            {
+                "iteration": int(self.scheduler.iteration + 1),
+                "selected": int(len(labelled)),
+                "generated": int(generated),
+                "best_acq": best_acq,
+                "mean_acq": mean_acq,
+            }
+        )
 
         self.scheduler.step(num_labelled=len(labelled), num_generated=generated)
+        self._append_live(
+            "iter=%d selected=%d generated=%d best_acq=%s mean_acq=%s"
+            % (
+                int(self.scheduler.iteration),
+                int(len(labelled)),
+                int(generated),
+                "n/a" if best_acq is None else f"{best_acq:.4f}",
+                "n/a" if mean_acq is None else f"{mean_acq:.4f}",
+            )
+        )
+        self._update_live_dashboard(selected=labelled, generated=generated)
 
         if self.scheduler.should_retrain_surrogate():
             self._retrain_surrogate()
@@ -1482,6 +1746,14 @@ class ActiveLearningLoop:
         if assemble_kwargs is None:
             assemble_kwargs = {}
         merged_kwargs = {**self.assemble_kwargs, **assemble_kwargs}
+        self._live_total_iterations = min(
+            int(getattr(self.scheduler.config, "max_iterations", n_iterations)),
+            int(self.scheduler.iteration + n_iterations),
+        )
+        self._append_live(
+            f"Run started: n_iterations={n_iterations}, goal_iteration={self._live_total_iterations}"
+        )
+        self._update_live_dashboard(selected=None, generated=0)
         for i in range(n_iterations):
             if self.scheduler.should_stop():
                 break
@@ -1493,6 +1765,8 @@ class ActiveLearningLoop:
                 len(self.pool),
             )
             self.run_iteration(cond=cond, assemble_kwargs=merged_kwargs)
+        self._append_live("Run finished.")
+        self._update_live_dashboard(selected=None, generated=0)
         return self.history
 
     def save_history(self) -> None:
