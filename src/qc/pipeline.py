@@ -35,6 +35,9 @@ PROPERTY_ALIAS = {
     "IE": "IE_eV",
     "EA": "EA_eV",
     "lambda_max": "lambda_max_nm",
+    "lambda_max_nm": "lambda_max_nm",
+    "oscillator_strength": "oscillator_strength",
+    "f_osc": "oscillator_strength",
 }
 
 
@@ -72,6 +75,16 @@ class QCPipeline:
     # ------------------------------------------------------------------
     def run(self, job: DFTJobSpec) -> QCResult:
         start = time.time()
+        props_preview = ",".join(map(str, tuple(job.properties or ())[:6]))
+        if job.properties and len(job.properties) > 6:
+            props_preview += ",..."
+        logger.info(
+            "QC job %s start | charge=%d mult=%d props=%s",
+            job.job_id,
+            int(job.charge),
+            int(job.multiplicity),
+            props_preview if props_preview else "-",
+        )
         try:
             geometry = generate_3d_geometry(job.smiles, self.config.geometry)
         except Exception as exc:  # pragma: no cover - defensive against RDKit crashes
@@ -192,6 +205,7 @@ class QCPipeline:
         )
         validation_error = self._validate_program_result(program_result, job)
         if validation_error:
+            logger.warning("QC job %s validation failed: %s", job.job_id, validation_error)
             return QCResult(
                 job=job,
                 properties={},
@@ -202,8 +216,11 @@ class QCPipeline:
                 geometry=geometry,
             )
 
+        requested_props = {str(p).strip().lower() for p in (job.properties or ())}
+        wants_reorg = "lambda_hole" in requested_props or "lambda_electron" in requested_props
+        compute_reorg = bool((job.metadata or {}).get("compute_reorganization_energies", False))
         neutral_energy = metadata.get("total_energy")
-        if neutral_energy is not None:
+        if neutral_energy is not None and wants_reorg and compute_reorg:
             reorg_updates = self._compute_reorganization_energies(geometry, job, neutral_energy, executor)
             if reorg_updates:
                 properties.update(reorg_updates)
@@ -222,6 +239,14 @@ class QCPipeline:
                 self.result_store.append(qc_result)
             except Exception as exc:  # pragma: no cover - IO errors
                 logger.error("Failed to store QC result for %s: %s", job.job_id, exc)
+        logger.info(
+            "QC job %s done | status=%s wall=%.1fs properties=%s fallback=%s",
+            job.job_id,
+            qc_result.status,
+            qc_result.wall_time,
+            ",".join(sorted(qc_result.properties.keys())) if qc_result.properties else "-",
+            bool(qc_result.metadata.get("fallback_used", False)),
+        )
         return qc_result
 
     # ------------------------------------------------------------------
@@ -240,6 +265,7 @@ class QCPipeline:
             charge=job.charge,
             multiplicity=job.multiplicity,
             solvent_model=task.solvent_model,
+            solvent=task.solvent,
             keywords=task.keywords,
             scratch_dir=task.scratch_dir,
             walltime_limit=task.walltime_limit,
@@ -264,6 +290,7 @@ class QCPipeline:
         for key, value in props.items():
             target = PROPERTY_ALIAS.get(key, key)
             results[target] = value
+        requested = {str(p).strip().lower() for p in (job.properties or ())}
         homo = results.get("HOMO_eV") or props.get("HOMO")
         lumo = results.get("LUMO_eV") or props.get("LUMO")
         if homo is not None and lumo is not None and "gap_eV" not in results:
@@ -272,15 +299,20 @@ class QCPipeline:
             results["IE_eV"] = -homo
         if lumo is not None and "EA_eV" not in results:
             results["EA_eV"] = -lumo
-        # ensure lambda estimates
-        if "lambda_hole" not in results:
-            results["lambda_hole"] = max(0.15, 0.3 - 0.02 * len(job.properties))
-        if "lambda_electron" not in results:
-            results["lambda_electron"] = results["lambda_hole"] + 0.05
+        # Lambda defaults are only added when explicitly requested (or no property list was provided).
+        wants_lambda = (not requested) or ("lambda_hole" in requested or "lambda_electron" in requested)
+        if wants_lambda:
+            if "lambda_hole" not in results:
+                results["lambda_hole"] = max(0.15, 0.3 - 0.02 * len(job.properties))
+            if "lambda_electron" not in results:
+                results["lambda_electron"] = results["lambda_hole"] + 0.05
         return results
 
     def _validate_program_result(self, program_result: ProgramResult, job: DFTJobSpec) -> Optional[str]:
         meta = program_result.metadata or {}
+        engine = str(meta.get("engine", "")).lower()
+        if engine == "orca" and meta.get("terminated_normally") is False:
+            return "ORCA did not terminate normally"
         if meta.get("scf_converged") is False:
             return "SCF did not converge"
         if "charge" in meta and meta["charge"] != job.charge:
@@ -294,6 +326,14 @@ class QCPipeline:
             imag_count = 0
         if imag_count > 0:
             return f"Imaginary frequencies detected ({imag_count})"
+        requested = {str(p).strip().lower() for p in (job.properties or ())}
+        available = {str(k).strip().lower() for k in (program_result.properties or {}).keys()}
+        if "homo" in requested and not ({"homo", "homo_ev"} & available):
+            return "Requested HOMO but parser returned no HOMO value"
+        if "lumo" in requested and not ({"lumo", "lumo_ev"} & available):
+            return "Requested LUMO but parser returned no LUMO value"
+        if "gap" in requested and not ({"gap", "gap_ev"} & available):
+            return "Requested gap but parser returned no gap value"
         return None
 
     # ------------------------------------------------------------------
@@ -322,6 +362,7 @@ class QCPipeline:
                 charge=charge,
                 multiplicity=multiplicity,
                 solvent_model=base_task.solvent_model,
+                solvent=base_task.solvent,
                 keywords=dict(base_task.keywords),
                 scratch_dir=base_task.scratch_dir,
                 walltime_limit=base_task.walltime_limit,

@@ -1,7 +1,14 @@
-import os
+import math
 import torch
 
-from src.models.jtvae_extended import JTVAE, JTVDataset, train_jtvae, sample_conditional, _evaluate_jtvae
+from src.models.jtvae_extended import (
+    JTVAE,
+    JTVDataset,
+    train_jtvae,
+    sample_conditional,
+    _evaluate_jtvae,
+    train_jtvae_rl_step,
+)
 from src.utils.device import get_device
 
 
@@ -74,3 +81,93 @@ def test_jtvae_train_and_metrics(tmp_path):
         device="cpu",
     )
     assert len(samples) == 4
+
+
+def _build_rl_trace(model: JTVAE, n_samples: int = 6):
+    samples, trace = model.sample_with_trace(
+        n_samples=n_samples,
+        max_tree_nodes=1,
+        fragment_idx_to_smiles={0: "C"},
+        device="cpu",
+        assemble_kwargs={"adjacency_threshold": 0.5},
+        temperature=1.0,
+    )
+    assert len(samples) == n_samples
+    assert "log_prob" in trace
+    assert "old_log_prob" in trace
+    assert "old_value" in trace
+    assert "frag_actions" in trace
+    assert "adj_actions" in trace
+    return samples, trace
+
+
+def test_jtvae_policy_gradient_rl_step():
+    model = JTVAE(
+        tree_feat_dim=4,
+        graph_feat_dim=5,
+        fragment_vocab_size=1,
+        z_dim=8,
+        hidden_dim=16,
+        cond_dim=0,
+        max_tree_nodes=1,
+    )
+    _, trace = _build_rl_trace(model, n_samples=6)
+    rewards = torch.linspace(0.0, 1.0, steps=6)
+    baseline = {"value": 0.0}
+    metrics, optimizer = train_jtvae_rl_step(
+        model,
+        trace,
+        rewards,
+        optimizer=None,
+        lr=1e-3,
+        algorithm="policy_gradient",
+        entropy_weight=0.01,
+        baseline_state=baseline,
+        value_loss_weight=0.5,
+        max_grad_norm=1.0,
+    )
+    assert isinstance(optimizer, torch.optim.Optimizer)
+    assert metrics["algorithm"] == "policy_gradient"
+    assert "policy_loss" in metrics
+    assert "value_loss" in metrics
+    assert "total_loss" in metrics
+    assert "grad_norm" in metrics
+    assert math.isfinite(float(metrics["total_loss"]))
+    assert math.isfinite(float(metrics["grad_norm"]))
+    assert baseline["value"] > 0.0
+
+
+def test_jtvae_ppo_rl_step():
+    model = JTVAE(
+        tree_feat_dim=4,
+        graph_feat_dim=5,
+        fragment_vocab_size=1,
+        z_dim=8,
+        hidden_dim=16,
+        cond_dim=0,
+        max_tree_nodes=1,
+    )
+    _, trace = _build_rl_trace(model, n_samples=8)
+    rewards = torch.linspace(-0.2, 1.2, steps=8)
+    metrics, optimizer = train_jtvae_rl_step(
+        model,
+        trace,
+        rewards,
+        optimizer=None,
+        lr=1e-3,
+        algorithm="ppo",
+        entropy_weight=0.01,
+        value_loss_weight=0.5,
+        ppo_clip_ratio=0.2,
+        ppo_epochs=2,
+        ppo_minibatch_size=4,
+        ppo_target_kl=1.0,
+        max_grad_norm=1.0,
+    )
+    assert isinstance(optimizer, torch.optim.Optimizer)
+    assert metrics["algorithm"] == "ppo"
+    assert float(metrics["ppo_update_steps"]) >= 1.0
+    assert float(metrics["ppo_epochs_ran"]) >= 1.0
+    assert "approx_kl" in metrics
+    assert math.isfinite(float(metrics["approx_kl"]))
+    assert math.isfinite(float(metrics["total_loss"]))

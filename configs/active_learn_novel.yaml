@@ -4,12 +4,12 @@ loop:
   device: cuda:0
   surrogate_device: cuda:0
   generator_device: cuda:0
-  batch_size: 12
+  batch_size: 16
   target_columns: [homo, lumo, gap]
   maximise: [false, true, false]
-  generator_samples: 128
-  generator_attempts: 6
-  results_dir: experiments/active_runs
+  generator_samples: 256
+  generator_attempts: 12
+  results_dir: experiments/active_runs_novel
   diversity_threshold: 0.75
   property_aliases:
     HOMO: homo
@@ -68,7 +68,7 @@ loop:
   export_sort_column: red_score
   export_require_qc_success: true
   export_require_red_pass: true
-  export_top_candidates_path: experiments/active_runs/top_red_candidates.csv
+  export_top_candidates_path: experiments/active_runs_novel/top_red_candidates.csv
   predict_num_workers: 12
   predict_pin_memory: true
   predict_amp: true
@@ -76,10 +76,12 @@ loop:
   max_generated_smiles_len: null
   generated_smiles_len_factor: null
   exclude_smiles_paths:
+    - data/raw/opv_db.csv
     - experiments/active_runs/active_learning_history.csv
+    - Rotlichtabsober.csv
   live_dashboard:
     enabled: false
-    path: experiments/active_runs/active_loop_live_dashboard.html
+    path: experiments/active_runs_novel/active_loop_live_dashboard.html
     refresh_ms: 1200
     selected_top_k: 8
     local_view_enabled: false
@@ -181,7 +183,7 @@ scheduler:
   generator_refresh_every: 0
 data:
   labelled: data/processed/opv_seed_500.csv
-  pool: data/raw/opv_db.csv
+  pool: data/processed/empty_pool.csv
   fragment_vocab: models/generator/fragment_vocab.json
 qc:
   pipeline_config: configs/qc_pipeline.yaml

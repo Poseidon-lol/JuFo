@@ -1,0 +1,18 @@
+targets:
+  HOMO_eV:
+    min: -6.1
+    max: -4.9
+  LUMO_eV:
+    min: -3.8
+    max: -2.4
+  gap_eV:
+    min: 1.2
+    max: 2.8
+  lambda_max_nm:
+    min: 650.0
+    max: 1400.0
+  oscillator_strength:
+    min: 0.20
+    max: 5.0
+
+min_confidence: 0.0

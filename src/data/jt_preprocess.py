@@ -1,4 +1,4 @@
-"""prep skript für jt-vae daten, zieht aus csv features und vocabs"""
+﻿"""prep skript fÃ¼r jt-vae daten, zieht aus csv features und vocabs"""
 
 import os
 import json
@@ -123,7 +123,7 @@ def _extract_ring_scaffold_fragments(mol: "Chem.Mol", smiles: str, min_heavy_ato
         if ms and ms.strip():
             frags.add(ms)
     except Exception:
-        logging.getLogger(__name__).debug("Murcko scaffold failed füuer %s", smiles)
+        logging.getLogger(__name__).debug("Murcko scaffold failed fÃ¼uer %s", smiles)
     if not frags:
         frags.add(smiles)
     entries = []
@@ -279,7 +279,13 @@ def frag_to_fp_vector(frag_smiles: str, n_bits=512):
 class JTPreprocessConfig:
     max_fragments: int = 12
     fp_bits: int = 512
-    condition_columns: Sequence[str] = ("HOMO", "LUMO")
+    condition_columns: Sequence[str] = (
+        "homo",
+        "lumo",
+        "gap",
+        "optical_lumo",
+        "spectral_overlap",
+    )
     normalise_conditions: bool = True
     min_fragment_frequency: int = 1
     fragment_method: str = "ring_scaffold"
@@ -315,7 +321,7 @@ def build_fragment_vocab(
 
 def fragment_adjacency_from_mol(smiles: str, fragments: list):
     """Returnt adjacency list zwischen fragmenten: wenn fragments gleiche atom indices haben -> dann connected
-    Also return mapping frag -> atom idx gesetzt für späteren gebrauch
+    Also return mapping frag -> atom idx gesetzt fÃ¼r spÃ¤teren gebrauch
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -466,7 +472,7 @@ def prepare_jtvae_examples(
     config:
         Optional :class: JTPreprocessConfig controlling preprocessing hyper-parameters
     max_heavy_atoms:
-        Skipt moleküle mit mehr heavy atoms als dieser Wert (oder None für kein limit)
+        Skipt molekÃ¼le mit mehr heavy atoms als dieser Wert (oder None fÃ¼r kein limit)
     """
 
     import pandas as pd
@@ -482,7 +488,7 @@ def prepare_jtvae_examples(
         raise TypeError("fragment_vocab muss ein mapping or (frag2idx, idx2frag) tuple sein")
 
     if "smiles" not in df.columns:
-        raise KeyError("Dataframe muss ein 'smiles' column enthöalten")
+        raise KeyError("Dataframe muss ein 'smiles' column enthÃ¶alten")
 
     cond_cols = list(config.condition_columns)
     missing = [c for c in cond_cols if c not in df.columns]
@@ -565,7 +571,7 @@ def prepare_jtvae_examples(
         ex["cond"] = torch.tensor(norm, dtype=torch.float32)
         examples.append(ex)
         if idx % 5000 == 0:
-            log.info("prepare_jtvae_examples: processed %d/%d Moleküle (%.1f%%)", idx, total, 100.0 * idx / total)
+            log.info("prepare_jtvae_examples: processed %d/%d MolekÃ¼le (%.1f%%)", idx, total, 100.0 * idx / total)
 
     config.condition_stats = {
         "mean": cond_mean.tolist(),
@@ -575,12 +581,21 @@ def prepare_jtvae_examples(
     return examples
 
 
-def preprocess(input_csv: str, out_dir: str, max_frags: int = 12, fp_bits: int = 512):
+def preprocess(
+    input_csv: str,
+    out_dir: str,
+    max_frags: int = 12,
+    fp_bits: int = 512,
+    *,
+    condition_columns: Optional[Sequence[str]] = None,
+):
     import pandas as pd
     df = pd.read_csv(input_csv)
     assert 'smiles' in df.columns, 'input CSV muss ein smiles column enthalten'
-    if not ('HOMO' in df.columns and 'LUMO' in df.columns):
-        raise ValueError('CSV muss HOMO und LUMO columns für conditioning enthalten')
+    cond_cols = list(condition_columns or ["homo", "lumo", "gap", "optical_lumo", "spectral_overlap"])
+    missing = [col for col in cond_cols if col not in df.columns]
+    if missing:
+        raise ValueError(f"CSV fehlt conditioning columns: {missing}")
 
     os.makedirs(out_dir, exist_ok=True)
     raw_smiles = df['smiles'].dropna().unique().tolist()
@@ -595,7 +610,7 @@ def preprocess(input_csv: str, out_dir: str, max_frags: int = 12, fp_bits: int =
     for _, row in tqdm(df.iterrows(), total=len(df)):
         smi = row['smiles']
         try:
-            cond_vals = [float(row['HOMO']), float(row['LUMO'])]
+            cond_vals = [float(row[col]) for col in cond_cols]
             ex = process_one(smi, cond_vals, frag2idx, max_frags=max_frags, fp_bits=fp_bits)
             examples.append(ex)
             conds.append(ex['cond_raw'])
@@ -606,7 +621,7 @@ def preprocess(input_csv: str, out_dir: str, max_frags: int = 12, fp_bits: int =
     conds = np.vstack(conds).astype(np.float32)
     mean = conds.mean(axis=0)
     std = conds.std(axis=0) + 1e-8
-    preprocessing_stats = {'cond_mean': mean.tolist(), 'cond_std': std.tolist()}
+    preprocessing_stats = {'cond_mean': mean.tolist(), 'cond_std': std.tolist(), 'columns': cond_cols}
     with open(os.path.join(out_dir, 'preprocessing_stats.json'), 'w') as f:
         json.dump(preprocessing_stats, f, indent=2)
 
@@ -628,5 +643,19 @@ if __name__ == '__main__':
     parser.add_argument('--out_dir', type=str, default='data/processed')
     parser.add_argument('--max_frags', type=int, default=12)
     parser.add_argument('--fp_bits', type=int, default=512)
+    parser.add_argument(
+        '--condition_columns',
+        type=str,
+        default='homo,lumo,gap,optical_lumo,spectral_overlap',
+        help='Komma-separierte Conditioning-Spalten fuer JT-VAE.',
+    )
     args = parser.parse_args()
-    preprocess(args.input, args.out_dir, max_frags=args.max_frags, fp_bits=args.fp_bits)
+    cond_cols = [c.strip() for c in str(args.condition_columns).split(',') if c.strip()]
+    preprocess(
+        args.input,
+        args.out_dir,
+        max_frags=args.max_frags,
+        fp_bits=args.fp_bits,
+        condition_columns=cond_cols,
+    )
+

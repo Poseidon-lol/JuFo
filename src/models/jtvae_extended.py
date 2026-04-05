@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Bernoulli, Categorical
 
 from pathlib import Path
 import sys
@@ -696,6 +697,12 @@ class JTVAE(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, cond_dim),
             )
+        value_in_dim = z_dim + (cond_dim if cond_dim and cond_dim > 0 else 0)
+        self.rl_value_head = nn.Sequential(
+            nn.Linear(value_in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar)
@@ -738,25 +745,12 @@ class JTVAE(nn.Module):
         assemble_kwargs: Optional[Dict] = None,
         temperature: float = 1.0,
     ):
-        device_spec = get_device(device)
-        target = device_spec.target
-        z = torch.randn(n_samples, self.z_dim, device=target) * float(temperature)
-        cond_t = None
-        if cond is not None:
-            if torch.is_tensor(cond):
-                cond_t = cond
-            else:
-                cond_np = cond if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
-                cond_t = torch.from_numpy(np.atleast_1d(cond_np)).float()
-            if cond_t.dim() == 0:
-                cond_t = cond_t.view(1, 1)
-            elif cond_t.dim() == 1:
-                cond_t = cond_t.unsqueeze(0)
-            cond_t = cond_t.repeat(n_samples, 1)
-            cond_t = cond_t.to(target)
-        elif self.cond_dim and self.cond_dim > 0:
-            # If conditioned model but no cond provided, sample with zero conditioning
-            cond_t = torch.zeros(n_samples, self.cond_dim, device=target)
+        _, z, cond_t = self._prepare_sampling_inputs(
+            n_samples=n_samples,
+            cond=cond,
+            device=device,
+            temperature=temperature,
+        )
         frags_logits, node_feats, adj_logits = self.decoder(z, max_tree_nodes=max_tree_nodes, cond=cond_t)
         if assemble_kwargs is None:
             assemble_kwargs = {}
@@ -811,6 +805,205 @@ class JTVAE(nn.Module):
             )
             samples.append(beam_result)
         return samples
+
+    def predict_value(self, z: torch.Tensor, cond: Optional[torch.Tensor] = None) -> torch.Tensor:
+        vec = z
+        if cond is not None:
+            vec = torch.cat([vec, cond], dim=-1)
+        values = self.rl_value_head(vec).squeeze(-1)
+        return values
+
+    def evaluate_actions(
+        self,
+        *,
+        z: torch.Tensor,
+        frag_actions: torch.Tensor,
+        adj_actions: torch.Tensor,
+        cond: Optional[torch.Tensor] = None,
+        max_tree_nodes: Optional[int] = None,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if frag_actions.dim() != 2:
+            raise ValueError(f"frag_actions must be [B, N], got shape {tuple(frag_actions.shape)}")
+        n_samples, n_nodes = int(frag_actions.shape[0]), int(frag_actions.shape[1])
+        use_nodes = n_nodes if max_tree_nodes is None else int(max_tree_nodes)
+        use_nodes = max(1, min(use_nodes, n_nodes))
+        frag_actions = frag_actions[:, :use_nodes].long()
+        frags_logits, _, adj_logits = self.decoder(z, max_tree_nodes=use_nodes, cond=cond)
+        logits = frags_logits[:, :use_nodes, :]
+        temp = max(1e-4, float(temperature))
+        frag_dist = Categorical(logits=logits / temp)
+        logp_frag = frag_dist.log_prob(frag_actions).sum(dim=1)
+        ent_frag = frag_dist.entropy().sum(dim=1)
+
+        tri = torch.triu_indices(use_nodes, use_nodes, offset=1, device=adj_logits.device)
+        if tri.numel() > 0:
+            pair_logits = adj_logits[:, tri[0], tri[1]]
+            adj_actions = adj_actions[:, : pair_logits.shape[1]].float()
+            adj_dist = Bernoulli(logits=pair_logits)
+            logp_adj = adj_dist.log_prob(adj_actions).sum(dim=1)
+            ent_adj = adj_dist.entropy().sum(dim=1)
+        else:
+            logp_adj = logits.new_zeros((n_samples,))
+            ent_adj = logits.new_zeros((n_samples,))
+
+        total_logp = logp_frag + logp_adj
+        total_entropy = ent_frag + ent_adj
+        values = self.predict_value(z, cond=cond)
+        return total_logp, total_entropy, values
+
+    def _prepare_sampling_inputs(
+        self,
+        *,
+        n_samples: int,
+        cond=None,
+        device=None,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.device, torch.Tensor, Optional[torch.Tensor]]:
+        device_spec = get_device(device)
+        target = device_spec.target
+        z = torch.randn(int(n_samples), self.z_dim, device=target) * float(temperature)
+        cond_t = None
+        if cond is not None:
+            if torch.is_tensor(cond):
+                cond_t = cond
+            else:
+                cond_np = cond if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
+                cond_t = torch.from_numpy(np.atleast_1d(cond_np)).float()
+            if cond_t.dim() == 0:
+                cond_t = cond_t.view(1, 1)
+            elif cond_t.dim() == 1:
+                cond_t = cond_t.unsqueeze(0)
+            cond_t = cond_t.repeat(int(n_samples), 1)
+            cond_t = cond_t.to(target)
+        elif self.cond_dim and self.cond_dim > 0:
+            # If conditioned model but no cond provided, sample with zero conditioning.
+            cond_t = torch.zeros(int(n_samples), self.cond_dim, device=target)
+        return target, z, cond_t
+
+    def sample_with_trace(
+        self,
+        n_samples: int = 32,
+        cond=None,
+        max_tree_nodes: int = 12,
+        fragment_idx_to_smiles=None,
+        device=None,
+        assemble_kwargs: Optional[Dict] = None,
+        temperature: float = 1.0,
+    ) -> Tuple[List[Dict[str, object]], Dict[str, torch.Tensor]]:
+        """Sample molecules and return policy trace tensors for REINFORCE updates."""
+
+        _, z, cond_t = self._prepare_sampling_inputs(
+            n_samples=n_samples,
+            cond=cond,
+            device=device,
+            temperature=temperature,
+        )
+        frags_logits, _, adj_logits = self.decoder(z, max_tree_nodes=max_tree_nodes, cond=cond_t)
+        max_nodes = min(int(max_tree_nodes), int(frags_logits.size(1)))
+        logits = frags_logits[:, :max_nodes, :]
+        adj_logits = adj_logits[:, :max_nodes, :max_nodes]
+
+        temp = max(1e-4, float(temperature))
+        frag_dist = Categorical(logits=logits / temp)
+        frag_actions = frag_dist.sample()
+        frag_log_prob = frag_dist.log_prob(frag_actions).sum(dim=1)
+        frag_entropy = frag_dist.entropy().sum(dim=1)
+
+        tri = torch.triu_indices(max_nodes, max_nodes, offset=1, device=adj_logits.device)
+        if tri.numel() > 0:
+            pair_logits = adj_logits[:, tri[0], tri[1]]
+            adj_dist = Bernoulli(logits=pair_logits)
+            adj_actions = adj_dist.sample()
+            adj_log_prob = adj_dist.log_prob(adj_actions).sum(dim=1)
+            adj_entropy = adj_dist.entropy().sum(dim=1)
+        else:
+            pair_logits = adj_logits.new_zeros((int(n_samples), 0))
+            adj_actions = adj_logits.new_zeros((int(n_samples), 0))
+            adj_log_prob = adj_logits.new_zeros((int(n_samples),))
+            adj_entropy = adj_logits.new_zeros((int(n_samples),))
+
+        total_log_prob = frag_log_prob + adj_log_prob
+        total_entropy = frag_entropy + adj_entropy
+        values = self.predict_value(z, cond=cond_t)
+
+        if assemble_kwargs is None:
+            assemble_kwargs = {}
+        penalties = assemble_kwargs.get(
+            "status_penalties",
+            {
+                "assembled": 0.0,
+                "single_fragment": 0.0,
+                "partial": -1.0,
+                "failed": -5.0,
+                "no_fragments": -10.0,
+                "rdkit_unavailable": -2.0,
+                "beam_empty": -10.0,
+                "default": -5.0,
+            },
+        )
+        adj_threshold = float(assemble_kwargs.get("adjacency_threshold", 0.5))
+        tri_i = tri[0].detach().cpu().numpy() if tri.numel() > 0 else np.asarray([], dtype=np.int64)
+        tri_j = tri[1].detach().cpu().numpy() if tri.numel() > 0 else np.asarray([], dtype=np.int64)
+
+        samples: List[Dict[str, object]] = []
+        for b in range(int(n_samples)):
+            if fragment_idx_to_smiles is None:
+                samples.append(
+                    {
+                        "smiles": "",
+                        "status": "no_vocab_mapping",
+                        "fragments": [],
+                        "score": float("-inf"),
+                        "log_prob": float(total_log_prob[b].detach().cpu().item()),
+                        "entropy": float(total_entropy[b].detach().cpu().item()),
+                        "value": float(values[b].detach().cpu().item()),
+                    }
+                )
+                continue
+
+            frag_idxs = frag_actions[b].detach().cpu().tolist()
+            frag_smiles = [str(fragment_idx_to_smiles.get(int(idx), "")) for idx in frag_idxs]
+            adjacency = np.zeros((max_nodes, max_nodes), dtype=np.float32)
+            if tri.numel() > 0:
+                vals = adj_actions[b].detach().cpu().numpy().astype(np.float32)
+                adjacency[tri_i, tri_j] = vals
+                adjacency[tri_j, tri_i] = vals
+            assembled_smiles, status = assemble_fragments(
+                frag_smiles,
+                adjacency,
+                threshold=adj_threshold,
+            )
+            if not _is_valid_smiles(assembled_smiles):
+                assembled_smiles = ""
+                status = "invalid_smiles"
+            score = float(total_log_prob[b].detach().cpu().item()) + _score_status(str(status), penalties)
+            samples.append(
+                {
+                    "smiles": assembled_smiles,
+                    "status": str(status),
+                    "fragments": frag_smiles,
+                    "score": float(score),
+                    "log_prob": float(total_log_prob[b].detach().cpu().item()),
+                    "entropy": float(total_entropy[b].detach().cpu().item()),
+                    "value": float(values[b].detach().cpu().item()),
+                }
+            )
+
+        trace: Dict[str, torch.Tensor] = {
+            "log_prob": total_log_prob,
+            "entropy": total_entropy,
+            "frag_actions": frag_actions,
+            "adj_actions": adj_actions,
+            "z": z,
+            "old_log_prob": total_log_prob.detach(),
+            "old_value": values.detach(),
+        }
+        if cond_t is not None:
+            trace["cond"] = cond_t
+        trace["max_tree_nodes"] = torch.tensor(int(max_nodes), device=z.device)
+        trace["temperature"] = torch.tensor(float(temperature), device=z.device)
+        return samples, trace
 
 # Loss and training utilities
 
@@ -892,6 +1085,561 @@ def jtvae_loss(
 
     total = recon_loss + beta * kl + aux_weight * property_loss + adj_weight * adj_loss
     return total, recon_loss, kl, property_loss, adj_loss
+
+
+def rl_policy_loss(
+    log_prob: torch.Tensor,
+    rewards: torch.Tensor,
+    *,
+    entropy: Optional[torch.Tensor] = None,
+    entropy_weight: float = 0.0,
+    baseline: Optional[float] = None,
+    baseline_state: Optional[Dict[str, float]] = None,
+    baseline_momentum: float = 0.9,
+    reward_clip: Optional[float] = None,
+    normalize_advantage: bool = True,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """REINFORCE-style policy loss with optional entropy regularisation."""
+
+    if log_prob.ndim != 1:
+        log_prob = log_prob.view(-1)
+    rewards_t = rewards.to(log_prob.device).float().view(-1)
+    if rewards_t.shape[0] != log_prob.shape[0]:
+        raise ValueError(
+            f"Shape mismatch for RL loss: log_prob={tuple(log_prob.shape)} rewards={tuple(rewards_t.shape)}"
+        )
+
+    if reward_clip is not None:
+        clip_val = abs(float(reward_clip))
+        rewards_t = rewards_t.clamp(min=-clip_val, max=clip_val)
+
+    if baseline is not None:
+        baseline_value = float(baseline)
+    elif baseline_state is not None and "value" in baseline_state:
+        baseline_value = float(baseline_state["value"])
+    else:
+        baseline_value = float(rewards_t.mean().detach().cpu().item())
+
+    advantage = rewards_t - baseline_value
+    if normalize_advantage and advantage.numel() > 1:
+        adv_std = advantage.std(unbiased=False)
+        advantage = (advantage - advantage.mean()) / (adv_std + float(eps))
+
+    policy_loss = -(advantage.detach() * log_prob).mean()
+    loss = policy_loss
+    entropy_term = 0.0
+    if entropy is not None and abs(float(entropy_weight)) > 1e-12:
+        entropy_vec = entropy.to(log_prob.device).float().view(-1)
+        if entropy_vec.shape[0] != log_prob.shape[0]:
+            raise ValueError(
+                f"Shape mismatch for entropy term: entropy={tuple(entropy_vec.shape)} log_prob={tuple(log_prob.shape)}"
+            )
+        entropy_reg = float(entropy_weight) * entropy_vec.mean()
+        loss = loss - entropy_reg
+        entropy_term = float(entropy_reg.detach().cpu().item())
+
+    reward_mean = float(rewards_t.mean().detach().cpu().item())
+    if baseline_state is not None:
+        old = float(baseline_state.get("value", baseline_value))
+        momentum = float(np.clip(float(baseline_momentum), 0.0, 0.9999))
+        baseline_state["value"] = momentum * old + (1.0 - momentum) * reward_mean
+
+    metrics = {
+        "reward_mean": reward_mean,
+        "reward_std": float(rewards_t.std(unbiased=False).detach().cpu().item()) if rewards_t.numel() > 1 else 0.0,
+        "baseline": float(baseline_value),
+        "advantage_mean": float(advantage.mean().detach().cpu().item()),
+        "advantage_std": float(advantage.std(unbiased=False).detach().cpu().item()) if advantage.numel() > 1 else 0.0,
+        "policy_loss": float(policy_loss.detach().cpu().item()),
+        "entropy_term": float(entropy_term),
+        "total_loss": float(loss.detach().cpu().item()),
+    }
+    return loss, metrics
+
+
+def _build_actor_critic_optimizer(
+    model: JTVAE,
+    *,
+    actor_lr: float,
+    critic_lr: float,
+) -> torch.optim.Optimizer:
+    critic_ids = {id(p) for p in model.rl_value_head.parameters() if p.requires_grad}
+    actor_params: List[torch.nn.Parameter] = []
+    critic_params: List[torch.nn.Parameter] = []
+    for _, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in critic_ids:
+            critic_params.append(param)
+        else:
+            actor_params.append(param)
+
+    groups: List[Dict[str, object]] = []
+    if actor_params:
+        groups.append({"params": actor_params, "lr": float(actor_lr), "name": "actor"})
+    if critic_params:
+        groups.append({"params": critic_params, "lr": float(critic_lr), "name": "critic"})
+    if not groups:
+        raise RuntimeError("No trainable parameters found for RL optimizer.")
+    return torch.optim.Adam(groups)
+
+
+def _get_actor_critic_lrs(
+    optimizer: torch.optim.Optimizer,
+    *,
+    default_lr: float,
+) -> Tuple[float, float]:
+    actor_lr = None
+    critic_lr = None
+    first_lr = None
+    for group in optimizer.param_groups:
+        lr_val = float(group.get("lr", default_lr))
+        if first_lr is None:
+            first_lr = lr_val
+        role = str(group.get("name", "")).strip().lower()
+        if role == "actor":
+            actor_lr = lr_val
+        elif role == "critic":
+            critic_lr = lr_val
+    if actor_lr is None:
+        actor_lr = float(first_lr if first_lr is not None else default_lr)
+    if critic_lr is None:
+        critic_lr = float(actor_lr)
+    return float(actor_lr), float(critic_lr)
+
+
+def _set_actor_critic_lrs(
+    optimizer: torch.optim.Optimizer,
+    *,
+    actor_lr: Optional[float] = None,
+    critic_lr: Optional[float] = None,
+) -> None:
+    actor_lr_val = None if actor_lr is None else float(actor_lr)
+    critic_lr_val = None if critic_lr is None else float(critic_lr)
+    had_actor_group = False
+    had_critic_group = False
+
+    for group in optimizer.param_groups:
+        role = str(group.get("name", "")).strip().lower()
+        if role == "actor":
+            had_actor_group = True
+            if actor_lr_val is not None:
+                group["lr"] = actor_lr_val
+        elif role == "critic":
+            had_critic_group = True
+            if critic_lr_val is not None:
+                group["lr"] = critic_lr_val
+
+    if not had_actor_group and actor_lr_val is not None and optimizer.param_groups:
+        optimizer.param_groups[0]["lr"] = actor_lr_val
+    if not had_critic_group and critic_lr_val is not None:
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[-1]["lr"] = critic_lr_val
+        elif actor_lr_val is None and optimizer.param_groups:
+            optimizer.param_groups[0]["lr"] = critic_lr_val
+
+
+def _explained_variance(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    y = y_true.detach().float().view(-1)
+    yp = y_pred.detach().float().view(-1)
+    if y.numel() != yp.numel() or y.numel() <= 1:
+        return 0.0
+    var_y = torch.var(y, unbiased=False)
+    if float(var_y.detach().cpu().item()) <= 1e-12:
+        return 0.0
+    resid = y - yp
+    var_resid = torch.var(resid, unbiased=False)
+    ev = 1.0 - float(var_resid.detach().cpu().item()) / float(var_y.detach().cpu().item())
+    if not np.isfinite(ev):
+        return 0.0
+    return float(ev)
+
+
+def train_jtvae_rl_step(
+    model: JTVAE,
+    trace: Dict[str, torch.Tensor],
+    rewards: torch.Tensor,
+    *,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    lr: float = 1e-5,
+    algorithm: str = "policy_gradient",
+    entropy_weight: float = 0.01,
+    baseline_state: Optional[Dict[str, float]] = None,
+    baseline_momentum: float = 0.9,
+    reward_clip: Optional[float] = None,
+    normalize_advantage: bool = True,
+    value_loss_weight: float = 0.5,
+    ppo_clip_ratio: float = 0.2,
+    ppo_epochs: int = 4,
+    ppo_minibatch_size: Optional[int] = None,
+    ppo_target_kl: Optional[float] = None,
+    ppo_value_clip_range: Optional[float] = 0.2,
+    ppo_adaptive_kl: bool = False,
+    ppo_adaptive_kl_high_mult: float = 1.5,
+    ppo_adaptive_kl_low_mult: float = 0.5,
+    ppo_lr_down_factor: float = 0.5,
+    ppo_lr_up_factor: float = 1.05,
+    ppo_clip_down_factor: float = 0.9,
+    ppo_clip_up_factor: float = 1.02,
+    ppo_actor_lr_min: Optional[float] = 1e-6,
+    ppo_actor_lr_max: Optional[float] = 1e-3,
+    ppo_clip_ratio_min: float = 0.05,
+    ppo_clip_ratio_max: float = 0.4,
+    actor_lr: Optional[float] = None,
+    critic_lr: Optional[float] = None,
+    anchor_weights: Optional[torch.Tensor] = None,
+    anchor_weight: float = 0.0,
+    max_grad_norm: Optional[float] = None,
+) -> Tuple[Dict[str, float], torch.optim.Optimizer]:
+    """Execute one RL update step for JT-VAE (policy-gradient or PPO)."""
+
+    algo = str(algorithm or "policy_gradient").strip().lower()
+    if "log_prob" not in trace:
+        raise KeyError("trace is missing required key 'log_prob'.")
+    if "z" not in trace:
+        raise KeyError("trace is missing required key 'z'.")
+    if "frag_actions" not in trace:
+        raise KeyError("trace is missing required key 'frag_actions'.")
+    if "adj_actions" not in trace:
+        raise KeyError("trace is missing required key 'adj_actions'.")
+
+    z = trace["z"]
+    cond = trace.get("cond", None)
+    frag_actions = trace["frag_actions"].long()
+    adj_actions = trace["adj_actions"].float()
+    max_tree_nodes = int(trace.get("max_tree_nodes", torch.tensor(int(frag_actions.shape[1]))).item())
+    temperature = float(trace.get("temperature", torch.tensor(1.0)).item())
+
+    rewards_t = rewards.to(z.device).float().view(-1)
+    if reward_clip is not None:
+        clip_val = abs(float(reward_clip))
+        rewards_t = rewards_t.clamp(min=-clip_val, max=clip_val)
+    if rewards_t.shape[0] != frag_actions.shape[0]:
+        raise ValueError(
+            f"Rewards batch size mismatch: rewards={tuple(rewards_t.shape)} vs actions={tuple(frag_actions.shape)}"
+        )
+
+    base_lr = float(lr)
+    actor_lr_eff = float(actor_lr) if actor_lr is not None else base_lr
+    critic_lr_eff = float(critic_lr) if critic_lr is not None else actor_lr_eff
+
+    if optimizer is None:
+        optimizer = _build_actor_critic_optimizer(
+            model,
+            actor_lr=actor_lr_eff,
+            critic_lr=critic_lr_eff,
+        )
+    else:
+        if actor_lr is not None or critic_lr is not None:
+            _set_actor_critic_lrs(
+                optimizer,
+                actor_lr=actor_lr_eff if actor_lr is not None else None,
+                critic_lr=critic_lr_eff if critic_lr is not None else None,
+            )
+
+    anchor_vec: Optional[torch.Tensor] = None
+    if anchor_weights is not None:
+        anchor_vec = anchor_weights.to(z.device).float().view(-1)
+        if anchor_vec.shape[0] != rewards_t.shape[0]:
+            raise ValueError(
+                f"anchor_weights batch size mismatch: anchor={tuple(anchor_vec.shape)} rewards={tuple(rewards_t.shape)}"
+            )
+
+    def _apply_grad_step(loss_t: torch.Tensor) -> float:
+        optimizer.zero_grad(set_to_none=True)
+        loss_t.backward()
+        grad_norm_local = 0.0
+        if max_grad_norm is not None and float(max_grad_norm) > 0.0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+            with contextlib.suppress(Exception):
+                grad_norm_local = float(grad_norm.detach().cpu().item())
+        else:
+            total_sq = 0.0
+            for p in model.parameters():
+                if p.grad is None:
+                    continue
+                total_sq += float(p.grad.detach().pow(2).sum().item())
+            grad_norm_local = float(total_sq ** 0.5)
+        optimizer.step()
+        return float(grad_norm_local)
+
+    model.train()
+    metrics: Dict[str, float] = {}
+    grad_norm_value = 0.0
+    anchor_weight_val = float(anchor_weight)
+    anchor_loss_scalar = 0.0
+    clipfrac_mean = 0.0
+    explained_var = 0.0
+
+    if algo in {"reinforce", "pg_reinforce"}:
+        log_prob = trace["log_prob"]
+        entropy = trace.get("entropy", None)
+        loss, metrics = rl_policy_loss(
+            log_prob=log_prob,
+            rewards=rewards_t,
+            entropy=entropy,
+            entropy_weight=float(entropy_weight),
+            baseline_state=baseline_state,
+            baseline_momentum=float(baseline_momentum),
+            reward_clip=None,
+            normalize_advantage=bool(normalize_advantage),
+        )
+        if anchor_vec is not None and anchor_weight_val > 0.0:
+            anchor_norm = torch.clamp(anchor_vec.sum(), min=1e-8)
+            anchor_loss = -(anchor_vec.detach() * log_prob).sum() / anchor_norm
+            loss = loss + anchor_weight_val * anchor_loss
+            anchor_loss_scalar = float(anchor_loss.detach().cpu().item())
+        grad_norm_value = _apply_grad_step(loss)
+        metrics["algorithm"] = "reinforce"
+        metrics["value_loss"] = 0.0
+        metrics["approx_kl"] = 0.0
+    elif algo in {"policy_gradient", "pg", "actor_critic"}:
+        log_prob_new, entropy_new, values_new = model.evaluate_actions(
+            z=z,
+            frag_actions=frag_actions,
+            adj_actions=adj_actions,
+            cond=cond,
+            max_tree_nodes=max_tree_nodes,
+            temperature=temperature,
+        )
+        advantage = rewards_t - values_new.detach()
+        if normalize_advantage and advantage.numel() > 1:
+            advantage = (advantage - advantage.mean()) / (advantage.std(unbiased=False) + 1e-8)
+        policy_loss = -(advantage * log_prob_new).mean()
+        value_loss = F.mse_loss(values_new, rewards_t)
+        entropy_term = float(entropy_weight) * entropy_new.mean()
+        loss = policy_loss + float(value_loss_weight) * value_loss - entropy_term
+        anchor_loss = torch.tensor(0.0, device=z.device)
+        if anchor_vec is not None and anchor_weight_val > 0.0:
+            anchor_norm = torch.clamp(anchor_vec.sum(), min=1e-8)
+            anchor_loss = -(anchor_vec.detach() * log_prob_new).sum() / anchor_norm
+            loss = loss + anchor_weight_val * anchor_loss
+            anchor_loss_scalar = float(anchor_loss.detach().cpu().item())
+        grad_norm_value = _apply_grad_step(loss)
+        reward_mean = float(rewards_t.mean().detach().cpu().item())
+        if baseline_state is not None:
+            old = float(baseline_state.get("value", reward_mean))
+            m = float(np.clip(float(baseline_momentum), 0.0, 0.9999))
+            baseline_state["value"] = m * old + (1.0 - m) * reward_mean
+        with torch.no_grad():
+            _, _, values_eval = model.evaluate_actions(
+                z=z,
+                frag_actions=frag_actions,
+                adj_actions=adj_actions,
+                cond=cond,
+                max_tree_nodes=max_tree_nodes,
+                temperature=temperature,
+            )
+        explained_var = _explained_variance(rewards_t, values_eval)
+        metrics = {
+            "algorithm": "policy_gradient",
+            "reward_mean": reward_mean,
+            "reward_std": float(rewards_t.std(unbiased=False).detach().cpu().item())
+            if rewards_t.numel() > 1
+            else 0.0,
+            "baseline": float(baseline_state.get("value", reward_mean)) if baseline_state is not None else reward_mean,
+            "advantage_mean": float(advantage.mean().detach().cpu().item()),
+            "advantage_std": float(advantage.std(unbiased=False).detach().cpu().item())
+            if advantage.numel() > 1
+            else 0.0,
+            "policy_loss": float(policy_loss.detach().cpu().item()),
+            "value_loss": float(value_loss.detach().cpu().item()),
+            "entropy_term": float(entropy_term.detach().cpu().item())
+            if torch.is_tensor(entropy_term)
+            else float(entropy_term),
+            "total_loss": float(loss.detach().cpu().item()),
+            "approx_kl": 0.0,
+            "clipfrac": 0.0,
+            "explained_variance": float(explained_var),
+        }
+    elif algo == "ppo":
+        old_log_prob = trace.get("old_log_prob", trace["log_prob"].detach()).to(z.device).float().view(-1)
+        old_value = trace.get("old_value", None)
+        if old_value is None:
+            with torch.no_grad():
+                _, _, old_value_eval = model.evaluate_actions(
+                    z=z,
+                    frag_actions=frag_actions,
+                    adj_actions=adj_actions,
+                    cond=cond,
+                    max_tree_nodes=max_tree_nodes,
+                    temperature=temperature,
+                )
+            old_value = old_value_eval.detach()
+        old_value = old_value.to(z.device).float().view(-1)
+        if old_log_prob.shape[0] != rewards_t.shape[0]:
+            raise ValueError(
+                f"PPO old_log_prob mismatch: {tuple(old_log_prob.shape)} vs rewards {tuple(rewards_t.shape)}"
+            )
+
+        advantage_full = rewards_t - old_value
+        if normalize_advantage and advantage_full.numel() > 1:
+            advantage_full = (advantage_full - advantage_full.mean()) / (
+                advantage_full.std(unbiased=False) + 1e-8
+            )
+
+        n = int(rewards_t.shape[0])
+        mb_size = int(ppo_minibatch_size) if ppo_minibatch_size is not None else n
+        mb_size = max(1, min(mb_size, n))
+        epochs = max(1, int(ppo_epochs))
+        clip_ratio = float(ppo_clip_ratio)
+        clip_ratio_min = max(1e-4, float(ppo_clip_ratio_min))
+        clip_ratio_max = max(clip_ratio_min, float(ppo_clip_ratio_max))
+        clip_ratio = float(np.clip(clip_ratio, clip_ratio_min, clip_ratio_max))
+        value_clip = None if ppo_value_clip_range is None else abs(float(ppo_value_clip_range))
+        target_kl = None if ppo_target_kl is None else float(ppo_target_kl)
+
+        last_policy_loss = 0.0
+        last_value_loss = 0.0
+        last_entropy_term = 0.0
+        last_total_loss = 0.0
+        approx_kl_acc = 0.0
+        clipfrac_acc = 0.0
+        update_steps = 0
+        stop_early = False
+        for _ in range(epochs):
+            perm = torch.randperm(n, device=z.device)
+            for start in range(0, n, mb_size):
+                mb_idx = perm[start : start + mb_size]
+                logp_new, entropy_new, value_new = model.evaluate_actions(
+                    z=z.index_select(0, mb_idx),
+                    frag_actions=frag_actions.index_select(0, mb_idx),
+                    adj_actions=adj_actions.index_select(0, mb_idx),
+                    cond=None if cond is None else cond.index_select(0, mb_idx),
+                    max_tree_nodes=max_tree_nodes,
+                    temperature=temperature,
+                )
+                adv_mb = advantage_full.index_select(0, mb_idx).detach()
+                old_logp_mb = old_log_prob.index_select(0, mb_idx).detach()
+                rewards_mb = rewards_t.index_select(0, mb_idx)
+                ratio = torch.exp(logp_new - old_logp_mb)
+                surr1 = ratio * adv_mb
+                surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv_mb
+                policy_loss = -torch.min(surr1, surr2).mean()
+                if value_clip is not None and value_clip > 0.0:
+                    old_value_mb = old_value.index_select(0, mb_idx).detach()
+                    v_clipped = old_value_mb + (value_new - old_value_mb).clamp(-value_clip, value_clip)
+                    v_loss_unclipped = (value_new - rewards_mb).pow(2)
+                    v_loss_clipped = (v_clipped - rewards_mb).pow(2)
+                    value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                else:
+                    value_loss = 0.5 * F.mse_loss(value_new, rewards_mb)
+                entropy_bonus = float(entropy_weight) * entropy_new.mean()
+                total_loss = policy_loss + float(value_loss_weight) * value_loss - entropy_bonus
+                anchor_loss = torch.tensor(0.0, device=z.device)
+                if anchor_vec is not None and anchor_weight_val > 0.0:
+                    anchor_mb = anchor_vec.index_select(0, mb_idx)
+                    anchor_norm = torch.clamp(anchor_mb.sum(), min=1e-8)
+                    anchor_loss = -(anchor_mb.detach() * logp_new).sum() / anchor_norm
+                    total_loss = total_loss + anchor_weight_val * anchor_loss
+                grad_norm_value = _apply_grad_step(total_loss)
+
+                with torch.no_grad():
+                    approx_kl = (old_logp_mb - logp_new).mean()
+                    clipfrac = ((ratio - 1.0).abs() > clip_ratio).float().mean()
+                approx_kl_acc += float(approx_kl.detach().cpu().item())
+                clipfrac_acc += float(clipfrac.detach().cpu().item())
+                update_steps += 1
+                last_policy_loss = float(policy_loss.detach().cpu().item())
+                last_value_loss = float(value_loss.detach().cpu().item())
+                last_entropy_term = float(entropy_bonus.detach().cpu().item())
+                last_total_loss = float(total_loss.detach().cpu().item())
+                anchor_loss_scalar = float(anchor_loss.detach().cpu().item())
+                if target_kl is not None and float(approx_kl.detach().cpu().item()) > target_kl:
+                    stop_early = True
+                    break
+            if stop_early:
+                break
+
+        with torch.no_grad():
+            _, _, values_eval = model.evaluate_actions(
+                z=z,
+                frag_actions=frag_actions,
+                adj_actions=adj_actions,
+                cond=cond,
+                max_tree_nodes=max_tree_nodes,
+                temperature=temperature,
+            )
+        explained_var = _explained_variance(rewards_t, values_eval)
+        clipfrac_mean = float(clipfrac_acc / max(1, update_steps))
+
+        reward_mean = float(rewards_t.mean().detach().cpu().item())
+        if baseline_state is not None:
+            old = float(baseline_state.get("value", reward_mean))
+            m = float(np.clip(float(baseline_momentum), 0.0, 0.9999))
+            baseline_state["value"] = m * old + (1.0 - m) * reward_mean
+
+        approx_kl_mean = float(approx_kl_acc / max(1, update_steps))
+        actor_lr_curr, critic_lr_curr = _get_actor_critic_lrs(optimizer, default_lr=base_lr)
+        actor_lr_next = actor_lr_curr
+        clip_ratio_next = clip_ratio
+        adaptive_event = "none"
+        if bool(ppo_adaptive_kl) and target_kl is not None and update_steps > 0:
+            high_mult = max(1.0, float(ppo_adaptive_kl_high_mult))
+            low_mult = max(0.0, min(float(ppo_adaptive_kl_low_mult), high_mult))
+            if approx_kl_mean > target_kl * high_mult:
+                actor_lr_next = actor_lr_curr * float(ppo_lr_down_factor)
+                clip_ratio_next = clip_ratio * float(ppo_clip_down_factor)
+                adaptive_event = "kl_high"
+            elif approx_kl_mean < target_kl * low_mult:
+                actor_lr_next = actor_lr_curr * float(ppo_lr_up_factor)
+                clip_ratio_next = clip_ratio * float(ppo_clip_up_factor)
+                adaptive_event = "kl_low"
+            if ppo_actor_lr_min is not None:
+                actor_lr_next = max(float(ppo_actor_lr_min), actor_lr_next)
+            if ppo_actor_lr_max is not None:
+                actor_lr_next = min(float(ppo_actor_lr_max), actor_lr_next)
+            clip_ratio_next = float(np.clip(clip_ratio_next, clip_ratio_min, clip_ratio_max))
+            if abs(actor_lr_next - actor_lr_curr) > 1e-16:
+                _set_actor_critic_lrs(optimizer, actor_lr=actor_lr_next, critic_lr=None)
+
+        metrics = {
+            "algorithm": "ppo",
+            "reward_mean": reward_mean,
+            "reward_std": float(rewards_t.std(unbiased=False).detach().cpu().item())
+            if rewards_t.numel() > 1
+            else 0.0,
+            "baseline": float(baseline_state.get("value", reward_mean)) if baseline_state is not None else reward_mean,
+            "advantage_mean": float(advantage_full.mean().detach().cpu().item()),
+            "advantage_std": float(advantage_full.std(unbiased=False).detach().cpu().item())
+            if advantage_full.numel() > 1
+            else 0.0,
+            "policy_loss": float(last_policy_loss),
+            "value_loss": float(last_value_loss),
+            "entropy_term": float(last_entropy_term),
+            "total_loss": float(last_total_loss),
+            "approx_kl": float(approx_kl_mean),
+            "clipfrac": float(clipfrac_mean),
+            "explained_variance": float(explained_var),
+            "ppo_epochs_ran": float(epochs),
+            "ppo_update_steps": float(update_steps),
+            "ppo_early_stop_kl": 1.0 if stop_early else 0.0,
+            "ppo_value_clip_range": 0.0 if value_clip is None else float(value_clip),
+            "ppo_clip_ratio_used": float(clip_ratio),
+            "next_ppo_clip_ratio": float(clip_ratio_next),
+            "ppo_kl_adapt_event": 0.0 if adaptive_event == "none" else (1.0 if adaptive_event == "kl_high" else -1.0),
+            "actor_lr": float(actor_lr_curr),
+            "critic_lr": float(critic_lr_curr),
+            "next_actor_lr": float(actor_lr_next),
+        }
+    else:
+        raise ValueError(
+            f"Unsupported RL algorithm '{algorithm}'. Choose one of: reinforce, policy_gradient, ppo."
+        )
+
+    actor_lr_final, critic_lr_final = _get_actor_critic_lrs(optimizer, default_lr=base_lr)
+    if "clipfrac" not in metrics:
+        metrics["clipfrac"] = float(clipfrac_mean)
+    if "explained_variance" not in metrics:
+        metrics["explained_variance"] = float(explained_var)
+    metrics["anchor_loss"] = float(anchor_loss_scalar)
+    metrics["anchor_weight"] = float(anchor_weight_val)
+    metrics["grad_norm"] = float(grad_norm_value)
+    metrics["lr"] = float(actor_lr_final)
+    metrics["actor_lr"] = float(actor_lr_final)
+    metrics["critic_lr"] = float(critic_lr_final)
+    return metrics, optimizer
 
 
 def _smiles_to_data_uri(smiles: str) -> Optional[str]:

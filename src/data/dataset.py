@@ -193,6 +193,10 @@ def apply_normalization(df: pd.DataFrame, stats: NormalizationStats, target_cols
 def create_property_dataset(df: pd.DataFrame, *, cache_graphs: bool = False): 
     """Convert dataframe into a PyG dataset mit ``mol_to_graph`` aus src.featurization.""" 
 
+    if not cache_graphs:
+        # SchNet-only cleanup: keep output format deterministic and remove MPNN dependency.
+        cache_graphs = True
+
     target_cols = [c for c in df.columns if c not in {"smiles", "id"}]
     graphs = []
     for _, row in df.iterrows():
@@ -222,11 +226,6 @@ def create_property_dataset(df: pd.DataFrame, *, cache_graphs: bool = False):
         #Graph speichern
         # -> Der Graph wird der Liste graphs hinzugefügt.
 
-    if not cache_graphs:
-        # return lazy dataset um nicht alle Data objects aufeinaml zu speichern
-        from src.models.mpnn import MoleculeDataset  # local import um  circular on module load zu vermeiden
-
-        return MoleculeDataset(df)
     return graphs
 
 

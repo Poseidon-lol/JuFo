@@ -101,13 +101,37 @@ def _load_pipeline_config(path: Path) -> PipelineConfig:
     return pipeline
 
 
-def _build_job(smiles: str, pipe_cfg: PipelineConfig) -> DFTJobSpec:
+def _infer_multiplicity_from_smiles(smiles: str, charge: int, default: int = 1) -> int:
+    """Infer a minimal spin multiplicity from electron parity.
+
+    Closed-shell even-electron systems -> singlet (1)
+    Odd-electron systems -> doublet (2)
+    """
+    try:
+        from rdkit import Chem
+    except Exception:
+        return int(default)
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return int(default)
+        electrons = sum(int(atom.GetAtomicNum()) for atom in mol.GetAtoms()) - int(charge)
+        return 2 if (electrons % 2 != 0) else 1
+    except Exception:
+        return int(default)
+
+
+def _build_job(smiles: str, pipe_cfg: PipelineConfig, *, auto_multiplicity: bool = False) -> DFTJobSpec:
+    charge = int(pipe_cfg.quantum.charge)
+    multiplicity = int(pipe_cfg.quantum.multiplicity)
+    if auto_multiplicity:
+        multiplicity = _infer_multiplicity_from_smiles(smiles, charge=charge, default=multiplicity)
     level = pipe_cfg.quantum.level_of_theory or f"{pipe_cfg.quantum.method}/{pipe_cfg.quantum.basis}"
     return DFTJobSpec(
         smiles=smiles,
         properties=list(pipe_cfg.quantum.properties),
-        charge=pipe_cfg.quantum.charge,
-        multiplicity=pipe_cfg.quantum.multiplicity,
+        charge=charge,
+        multiplicity=multiplicity,
         metadata={
             "engine": pipe_cfg.quantum.engine,
             "level_of_theory": level,
@@ -151,6 +175,12 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=None, help="Override max_workers from qc config.")
     parser.add_argument("--resume", action="store_true", help="Skip SMILES already in output.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output if it exists.")
+    parser.add_argument(
+        "--auto-multiplicity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Infer multiplicity from electron parity (odd electrons -> doublet).",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -186,9 +216,22 @@ def main() -> None:
     done = set()
     if output_path.exists() and args.resume:
         try:
-            prev = pd.read_csv(output_path, usecols=[smiles_col])
-            done = set(prev[smiles_col].dropna().astype(str))
-            LOGGER.info("Resuming: %d SMILES already labeled.", len(done))
+            prev = pd.read_csv(output_path)
+            if smiles_col not in prev.columns:
+                for candidate in ("smiles", "smile", "SMILES"):
+                    if candidate in prev.columns:
+                        smiles_col = candidate
+                        break
+            if "qc_status" in prev.columns:
+                ok_mask = prev["qc_status"].astype(str).str.lower() == "success"
+                done = set(prev.loc[ok_mask, smiles_col].dropna().astype(str))
+                LOGGER.info(
+                    "Resuming: %d successful SMILES already labeled (errors/fallbacks will be retried).",
+                    len(done),
+                )
+            else:
+                done = set(prev[smiles_col].dropna().astype(str))
+                LOGGER.info("Resuming: %d SMILES already labeled.", len(done))
         except Exception as exc:
             LOGGER.warning("Failed to load resume file (%s); proceeding without resume.", exc)
 
@@ -220,7 +263,7 @@ def main() -> None:
         smi = str(row[smiles_col]).strip()
         if smi in done:
             continue
-        job = _build_job(smi, pipe_cfg)
+        job = _build_job(smi, pipe_cfg, auto_multiplicity=bool(args.auto_multiplicity))
         future = manager.submit(job)
         futures[future] = row.to_dict()
         submitted += 1

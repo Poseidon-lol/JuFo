@@ -1,0 +1,150 @@
+modes:
+  red:
+    description: "Red-light absorber optimization (lambda_max in deep-visible red)."
+    acquisition:
+      kind: target
+      beta: 0.0
+      xi: 0.01
+      targets: [-5.3, -3.1, 1.6]
+      tolerances: [0.3, 0.4, 0.5]
+      weights: [0.8, 0.8, 1.4]
+      maximise: [false, true, false]
+    objective_score:
+      columns: [lambda_max_nm, oscillator_strength, gap]
+      targets: [680.0, 0.25, 1.8]
+      tolerances: [60.0, 0.08, 0.45]
+      weights: [1.2, 1.6, 0.8]
+      missing_penalty: 3.0
+      pass_threshold: -2.0
+      require_qc_success: true
+      export_sort_column: red_score
+    hard_gates:
+      min_lambda_max_nm: 650.0
+      min_oscillator_strength: 0.20
+      max_lambda_max_nm: null
+      max_oscillator_strength: null
+    optical:
+      score_weight: 0.0
+      target_columns: [lambda_max_nm]
+      targets: [680.0]
+      tolerances: [60.0]
+      weights: [1.0]
+      beta: 0.0
+    oscillator:
+      score_weight: 0.0
+      target_columns: [oscillator_strength]
+      targets: [0.20]
+      tolerances: [0.10]
+      weights: [1.0]
+      beta: 0.0
+    rl_reward_weights:
+      lambda_max_nm: 1.2
+      oscillator_strength: 1.6
+      gap: 0.8
+      uncertainty_penalty: 0.6
+      invalid_penalty: 6.0
+      duplicate_penalty: 2.5
+      in_range_bonus: 0.25
+      diversity_weight: 0.25
+      novelty_bonus: 0.15
+    qc_extra_properties: [lambda_max, oscillator_strength]
+
+  blue:
+    description: "Blue-light absorber optimization (lambda_max in blue range)."
+    acquisition:
+      kind: target
+      beta: 0.0
+      xi: 0.01
+      targets: [-5.5, -2.8, 2.5]
+      tolerances: [0.4, 0.5, 0.6]
+      weights: [0.9, 0.7, 1.3]
+      maximise: [false, true, false]
+    objective_score:
+      columns: [lambda_max_nm, oscillator_strength, gap]
+      targets: [460.0, 0.28, 2.5]
+      tolerances: [35.0, 0.10, 0.50]
+      weights: [1.6, 1.1, 0.9]
+      missing_penalty: 3.0
+      pass_threshold: -2.0
+      require_qc_success: true
+      export_sort_column: red_score
+    hard_gates:
+      min_lambda_max_nm: 420.0
+      min_oscillator_strength: 0.18
+      max_lambda_max_nm: 520.0
+      max_oscillator_strength: null
+    optical:
+      score_weight: 0.0
+      target_columns: [lambda_max_nm]
+      targets: [460.0]
+      tolerances: [35.0]
+      weights: [1.0]
+      beta: 0.0
+    oscillator:
+      score_weight: 0.0
+      target_columns: [oscillator_strength]
+      targets: [0.24]
+      tolerances: [0.12]
+      weights: [1.0]
+      beta: 0.0
+    rl_reward_weights:
+      lambda_max_nm: 1.5
+      oscillator_strength: 1.0
+      gap: 1.0
+      uncertainty_penalty: 0.6
+      invalid_penalty: 5.5
+      duplicate_penalty: 2.2
+      in_range_bonus: 0.20
+      diversity_weight: 0.20
+      novelty_bonus: 0.10
+    qc_extra_properties: [lambda_max, oscillator_strength]
+
+  general:
+    description: "General organic semiconductor optimization without strict color window."
+    acquisition:
+      kind: target
+      beta: 0.0
+      xi: 0.01
+      targets: [-5.3, -3.1, 1.8]
+      tolerances: [0.4, 0.5, 0.7]
+      weights: [1.0, 1.0, 1.0]
+      maximise: [false, true, false]
+    objective_score:
+      columns: [homo, lumo, gap]
+      targets: [-5.3, -3.1, 1.8]
+      tolerances: [0.4, 0.5, 0.7]
+      weights: [1.0, 1.0, 1.0]
+      missing_penalty: 2.0
+      pass_threshold: -2.0
+      require_qc_success: false
+      export_sort_column: acquisition_score
+    hard_gates:
+      min_lambda_max_nm: null
+      min_oscillator_strength: null
+      max_lambda_max_nm: null
+      max_oscillator_strength: null
+    optical:
+      score_weight: 0.0
+      target_columns: [lambda_max_nm]
+      targets: [550.0]
+      tolerances: [150.0]
+      weights: [0.4]
+      beta: 0.0
+    oscillator:
+      score_weight: 0.0
+      target_columns: [oscillator_strength]
+      targets: [0.20]
+      tolerances: [0.25]
+      weights: [0.3]
+      beta: 0.0
+    rl_reward_weights:
+      homo: 1.0
+      lumo: 1.0
+      gap: 1.0
+      uncertainty_penalty: 0.4
+      invalid_penalty: 4.0
+      duplicate_penalty: 1.5
+      in_range_bonus: 0.10
+      diversity_weight: 0.15
+      novelty_bonus: 0.05
+    qc_extra_properties: [lambda_max, oscillator_strength]

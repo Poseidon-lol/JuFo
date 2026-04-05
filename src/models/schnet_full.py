@@ -146,18 +146,17 @@ def train_schnet_full(
     )
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.use_amp) and device.type == "cuda")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=cfg.pin_memory,
-    )
-    val_loader = (
-        DataLoader(val_ds, batch_size=cfg.batch_size, num_workers=cfg.num_workers, pin_memory=cfg.pin_memory)
-        if val_ds is not None
-        else None
-    )
+    loader_kwargs = {
+        "batch_size": cfg.batch_size,
+        "num_workers": cfg.num_workers,
+        "pin_memory": cfg.pin_memory,
+    }
+    if cfg.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs) if val_ds is not None else None
 
     loss_is_l1 = str(cfg.loss).lower() == "l1"
     target_weights = None

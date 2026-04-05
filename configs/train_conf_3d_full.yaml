@@ -1,37 +1,43 @@
 dataset:
-  path: data/showcase/jtvae_showcase_6000.csv
+  path: data/raw/opv_db.csv
   mol_column: mol
   smiles_column: smiles
-  target_columns: [homo, lumo, gap]
-  val_fraction: 0.1
+  target_columns: [homo, lumo, gap, optical_lumo, spectral_overlap]
+  val_fraction: 0.08
 
 model:
   hidden_channels: 256
   num_filters: 256
   num_interactions: 8
-  num_gaussians: 120
+  num_gaussians: 128
   cutoff: 10.0
   readout: add
   head_dropout: 0.1
   interaction_dropout: 0.1
 
 training:
-  n_models: 3
-  epochs: 240
-  batch_size: 32
-  lr: 0.001
-  weight_decay: 0.0
-  patience: 30
-  scheduler_patience: 20
-  device: auto
+  # Note: train-surrogate-3d-full currently trains one model per run.
+  n_models: 1
+  epochs: 260
+  batch_size: 96
+  lr: 0.0003
+  weight_decay: 0.000005
+  patience: 36
+  scheduler_patience: 14
+  device: cuda:0
   use_amp: true
-  compile: false
+  num_workers: 8
+  pin_memory: true
+  grad_clip: 2.0
+  loss: smooth_l1
+  seed: 1337
+  compile: true
   compile_mode: default
   compile_fullgraph: false
-  save_dir: models/surrogate_3d_full
+  save_dir: models/surrogate_3d_full_heavy
   live_dashboard:
     enabled: true
-    path: experiments/showcase/schnet_full_live_dashboard.html
+    path: experiments/full/schnet_full_heavy_live_dashboard.html
     refresh_ms: 900
     local_view_enabled: true
     local_view_host: 127.0.0.1

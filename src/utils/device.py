@@ -98,6 +98,13 @@ def move_to_device(obj: Any, device: DeviceSpec) -> Any:
 def ensure_state_dict_on_cpu(model: torch.nn.Module, device: DeviceSpec) -> dict[str, torch.Tensor]:
     """Return a state dict that is safe to serialise regardless of backend."""
     state = model.state_dict()
+    # torch.compile can wrap modules and emit "_orig_mod." key prefixes.
+    # Normalize keys so checkpoints load into the plain eager model class.
+    if any(k.startswith("_orig_mod.") or "._orig_mod." in k for k in state.keys()):
+        state = {
+            (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k.replace("._orig_mod.", ".")): v
+            for k, v in state.items()
+        }
     if device.type == "directml":
         return {k: v.detach().cpu() for k, v in state.items()}
     return state

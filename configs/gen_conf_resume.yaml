@@ -1,6 +1,6 @@
 dataset:
   path: data/raw/opv_db.csv
-  target_columns: [homo, lumo, gap]
+  target_columns: [homo, lumo, gap, optical_lumo, spectral_overlap]
   max_fragments: 16
   fragment_min_count: 1
   max_heavy_atoms: null
@@ -9,7 +9,7 @@ dataset:
 model:
   z_dim: 64
   hidden_dim: 256
-  cond_dim: 3
+  cond_dim: 5
 training:
   epochs: 96
   batch_size: 32

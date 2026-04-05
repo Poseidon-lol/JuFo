@@ -1,6 +1,6 @@
 dataset:
   path: data/showcase/jtvae_showcase_6000.csv
-  target_columns: [homo, lumo, gap]
+  target_columns: [homo, lumo, gap, optical_lumo, spectral_overlap]
   max_fragments: 16
   fragment_min_count: 2
   max_heavy_atoms: 80
@@ -10,7 +10,7 @@ model:
   z_dim: 128
   hidden_dim: 256
   encoder_layers: 12
-  cond_dim: 3
+  cond_dim: 5
 training:
   epochs: 400
   batch_size: 128

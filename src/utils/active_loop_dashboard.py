@@ -180,6 +180,11 @@ def write_active_loop_dashboard(
 
     last_best = _fmt_float(history_rows[-1].get("best_acq") if history_rows else None)
     last_mean = _fmt_float(history_rows[-1].get("mean_acq") if history_rows else None)
+    last_rl_reward = _fmt_float(history_rows[-1].get("rl_reward_mean") if history_rows else None)
+    last_rl_loss = _fmt_float(history_rows[-1].get("rl_total_loss") if history_rows else None)
+    last_rl_kl = _fmt_float(history_rows[-1].get("rl_approx_kl") if history_rows else None)
+    last_rl_clipfrac = _fmt_float(history_rows[-1].get("rl_clipfrac") if history_rows else None)
+    last_rl_ev = _fmt_float(history_rows[-1].get("rl_explained_variance") if history_rows else None)
 
     cards: List[str] = []
     for row in selected_rows:
@@ -224,6 +229,12 @@ def write_active_loop_dashboard(
             f"<td>{int(row.get('generated', 0))}</td>"
             f"<td>{_fmt_float(row.get('best_acq'))}</td>"
             f"<td>{_fmt_float(row.get('mean_acq'))}</td>"
+            f"<td>{_fmt_float(row.get('rl_reward_mean'))}</td>"
+            f"<td>{_fmt_float(row.get('rl_total_loss'))}</td>"
+            f"<td>{_fmt_float(row.get('rl_validity'))}</td>"
+            f"<td>{_fmt_float(row.get('rl_approx_kl'))}</td>"
+            f"<td>{_fmt_float(row.get('rl_clipfrac'))}</td>"
+            f"<td>{_fmt_float(row.get('rl_explained_variance'))}</td>"
             "</tr>"
         )
 
@@ -269,7 +280,7 @@ def write_active_loop_dashboard(
     }}
     .kpis {{
       display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
+      grid-template-columns: repeat(11, minmax(0, 1fr));
       gap: 8px;
       margin-bottom: 10px;
     }}
@@ -389,6 +400,11 @@ def write_active_loop_dashboard(
           <div class="kpi"><div class="key">Selected (last)</div><div class="val">{selected_last}</div></div>
           <div class="kpi"><div class="key">Best Acq (last)</div><div class="val">{last_best}</div></div>
           <div class="kpi"><div class="key">Mean Acq (last)</div><div class="val">{last_mean}</div></div>
+          <div class="kpi"><div class="key">RL Reward (last)</div><div class="val">{last_rl_reward}</div></div>
+          <div class="kpi"><div class="key">RL Loss (last)</div><div class="val">{last_rl_loss}</div></div>
+          <div class="kpi"><div class="key">RL KL (last)</div><div class="val">{last_rl_kl}</div></div>
+          <div class="kpi"><div class="key">RL ClipFrac</div><div class="val">{last_rl_clipfrac}</div></div>
+          <div class="kpi"><div class="key">RL ExpVar</div><div class="val">{last_rl_ev}</div></div>
         </div>
         <div class="box">
           <div class="muted">Fortschritt {progress * 100.0:.1f}%</div>
@@ -408,8 +424,8 @@ def write_active_loop_dashboard(
         <div class="box" style="margin-top:12px;">
           <h2>Iterations-Historie</h2>
           <table>
-            <thead><tr><th>Iter</th><th>Selected</th><th>Generated</th><th>Best Acq</th><th>Mean Acq</th></tr></thead>
-            <tbody>{"".join(hist_rows) if hist_rows else "<tr><td colspan='5' class='muted'>Noch keine Werte</td></tr>"}</tbody>
+            <thead><tr><th>Iter</th><th>Selected</th><th>Generated</th><th>Best Acq</th><th>Mean Acq</th><th>RL Reward</th><th>RL Loss</th><th>RL Validity</th><th>RL KL</th><th>RL ClipFrac</th><th>RL ExpVar</th></tr></thead>
+            <tbody>{"".join(hist_rows) if hist_rows else "<tr><td colspan='11' class='muted'>Noch keine Werte</td></tr>"}</tbody>
           </table>
         </div>
       </div>

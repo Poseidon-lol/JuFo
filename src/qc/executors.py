@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import re
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Protocol, Tuple
@@ -68,6 +71,18 @@ class ExternalProgramExecutor:
             tmp_ctx = tempfile.TemporaryDirectory(prefix=f"{self.name}_")
             workdir = Path(tmp_ctx.__enter__())
         try:
+            props_str = ",".join(map(str, tuple(task.properties or ())))
+            logger.info(
+                "QC executor %s start | method=%s basis=%s charge=%d mult=%d props=%s workdir=%s",
+                self.name,
+                task.method,
+                task.basis,
+                int(task.charge),
+                int(task.multiplicity),
+                props_str if props_str else "-",
+                workdir,
+            )
+            started = time.perf_counter()
             input_path = workdir / "input.inp"
             output_path = workdir / "output.out"
             self._write_input(input_path, geometry, task)
@@ -79,6 +94,12 @@ class ExternalProgramExecutor:
             metadata["level_of_theory"] = task.level_of_theory if hasattr(task, "level_of_theory") else f"{task.method}/{task.basis}"
             metadata["workdir"] = str(workdir)
             raw_text = output_path.read_text(encoding="utf-8", errors="replace")
+            logger.info(
+                "QC executor %s done in %.1fs | parsed_properties=%s",
+                self.name,
+                time.perf_counter() - started,
+                ",".join(sorted(properties.keys())) if properties else "-",
+            )
             return ProgramResult(properties=properties, metadata=metadata, raw_output=raw_text)
         finally:
             if tmp_ctx is not None:
@@ -95,9 +116,12 @@ class ExternalProgramExecutor:
         if task.environment:
             env.update(task.environment)
         exe_parent = Path(self.executable).parent
-        env["PATH"] = f"{exe_parent};{env.get('PATH', '')}"
+        path_sep = os.pathsep
+        existing_path = env.get("PATH", "")
+        env["PATH"] = f"{exe_parent}{path_sep}{existing_path}" if existing_path else str(exe_parent)
         cmd = [self.executable, input_path.name]
         logger.debug("Running %s with command: %s", self.name, cmd)
+        started = time.perf_counter()
         try:
             with output_path.open("w", encoding="utf-8") as out_f:
                 completed = subprocess.run(
@@ -111,14 +135,36 @@ class ExternalProgramExecutor:
                     timeout=task.walltime_limit,
                 )
         except FileNotFoundError as exc:  # pragma: no cover - depends on system
-            raise ExecutionError(f"{self.executable} not found: {exc}") from exc
+            raise ExecutionError(f"{self.executable} not found: {exc} (workdir={workdir})") from exc
         except subprocess.TimeoutExpired as exc:
-            raise ExecutionError(f"{self.name} exceeded walltime limit ({task.walltime_limit}s)") from exc
+            raise ExecutionError(
+                f"{self.name} exceeded walltime limit ({task.walltime_limit}s) (workdir={workdir})"
+            ) from exc
         except subprocess.CalledProcessError as exc:
-            raise ExecutionError(f"{self.name} failed with return code {exc.returncode}: {exc.stderr}") from exc
+            stderr_tail = ""
+            if exc.stderr:
+                lines = [ln for ln in exc.stderr.strip().splitlines() if ln.strip()]
+                if lines:
+                    stderr_tail = lines[-1][:400]
+            raise ExecutionError(
+                f"{self.name} failed rc={exc.returncode} workdir={workdir} stderr_tail={stderr_tail}"
+            ) from exc
 
         if completed.stderr:
-            (workdir / "stderr.log").write_text(completed.stderr, encoding="utf-8")
+            stderr_log = workdir / "stderr.log"
+            stderr_log.write_text(completed.stderr, encoding="utf-8")
+            logger.warning(
+                "%s wrote stderr (%d chars) -> %s",
+                self.name,
+                len(completed.stderr),
+                stderr_log,
+            )
+        logger.info(
+            "QC executor %s process finished rc=%d in %.1fs",
+            self.name,
+            int(completed.returncode),
+            time.perf_counter() - started,
+        )
 
     def _parse_output(self, path: Path, task: QuantumTaskConfig) -> Tuple[Dict[str, float], Dict[str, Any]]:
         raise NotImplementedError
@@ -194,7 +240,23 @@ class OrcaExecutor(ExternalProgramExecutor):
     executable = "orca"
 
     def _write_input(self, path: Path, geometry: GeometryResult, task: QuantumTaskConfig) -> None:
+        task_keywords = dict(task.keywords or {})
+
+        def _as_pos_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+            try:
+                ivalue = int(value)
+            except (TypeError, ValueError):
+                return default
+            return ivalue if ivalue > 0 else default
+
         keywords = [task.method, task.basis, "TightSCF"]
+        extra_keywords = task_keywords.get("extra_keywords")
+        if isinstance(extra_keywords, str):
+            extra_keywords = [extra_keywords]
+        if isinstance(extra_keywords, (list, tuple)):
+            for kw in extra_keywords:
+                if kw:
+                    keywords.append(str(kw))
         if task.solvent_model:
             if task.solvent:
                 keywords.append(f"{task.solvent_model}({task.solvent})")
@@ -211,10 +273,26 @@ class OrcaExecutor(ExternalProgramExecutor):
         if task.dispersion:
             header += f" {task.dispersion}"
         lines = [header]
+        maxcore = _as_pos_int(task_keywords.get("maxcore"))
+        if maxcore is not None:
+            lines.append(f"%maxcore {maxcore}")
+        nprocs = _as_pos_int(task_keywords.get("nprocs"))
+        if nprocs is None:
+            nprocs = _as_pos_int(task_keywords.get("pal_nprocs"))
+        if nprocs is not None:
+            lines.extend(["%pal", f"nprocs {nprocs}", "end"])
         if use_tddft:
-            lines.extend(["%tddft", "nroots 10", "end"])
+            nroots = _as_pos_int(task_keywords.get("tddft_nroots"), default=10)
+            lines.extend(["%tddft", f"nroots {nroots}", "end"])
         if use_polar:
             lines.extend(["%elprop", "Polar 1", "end"])
+        logger.info(
+            "ORCA input setup | nprocs=%s maxcore=%s tddft=%s polar=%s",
+            nprocs if nprocs is not None else 1,
+            maxcore if maxcore is not None else "default",
+            bool(use_tddft),
+            bool(use_polar),
+        )
         lines.append(f"* xyz {task.charge} {task.multiplicity}")
         if geometry.xyz:
             for row in geometry.xyz.splitlines()[2:]:
@@ -229,13 +307,32 @@ class OrcaExecutor(ExternalProgramExecutor):
         metadata: Dict[str, Any] = {}
         orbitals = []
         in_orbital_block = False
+        in_absorption_table = False
         tddft_states = []
         polar = None
+        warning_lines = 0
+        metadata["terminated_normally"] = False
         for line in text.splitlines():
             stripped = line.strip()
-            if "TOTAL SCF ENERGY" in line:
+            upper = stripped.upper()
+            if "ORCA TERMINATED NORMALLY" in upper:
+                metadata["terminated_normally"] = True
+            if "SCF CONVERGED AFTER" in upper:
+                metadata["scf_converged"] = True
+            if "SCF NOT CONVERGED" in upper or "SCF FAILED TO CONVERGE" in upper:
+                metadata["scf_converged"] = False
+            if "WARNING" in upper:
+                warning_lines += 1
+            if "TOTAL SCF ENERGY" in upper:
                 continue
-            if "Total Energy" in line and ":" in line and "Eh" in line:
+            if "FINAL SINGLE POINT ENERGY" in upper:
+                match = re.search(r"FINAL SINGLE POINT ENERGY\s+(-?\d+(?:\.\d+)?)", stripped, flags=re.I)
+                if match:
+                    try:
+                        metadata["total_energy"] = float(match.group(1))
+                    except Exception:
+                        pass
+            if "TOTAL ENERGY" in upper and ":" in line and "EH" in upper:
                 tokens = line.replace(":", " ").split()
                 for token in tokens:
                     try:
@@ -243,23 +340,86 @@ class OrcaExecutor(ExternalProgramExecutor):
                         break
                     except Exception:
                         continue
-            if "Isotropic polarizability" in line:
-                try:
-                    polar = float(line.split()[-2])
-                    props["polarizability"] = polar
-                except Exception:
-                    pass
-            if stripped.startswith("Excited State"):
-                # ORCA TDDFT excitation line: Excited State  1:   Singlet-A      3.12 eV 397.5 nm  f=0.1234
-                ev_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*eV", stripped)
-                nm_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*nm", stripped)
-                f_match = re.search(r"f\s*=\s*([0-9]+(?:\.[0-9]+)?)", stripped)
+            if "ABSORPTION SPECTRUM VIA TRANSITION ELECTRIC DIPOLE MOMENTS" in upper:
+                in_absorption_table = True
+                continue
+            if in_absorption_table and "ABSORPTION SPECTRUM VIA" in upper and "ELECTRIC DIPOLE MOMENTS" not in upper:
+                in_absorption_table = False
+            if "MAGNITUDE" in upper and "DEBYE" in upper:
+                matches = re.findall(r"(-?\d+(?:\.\d+)?)", stripped)
+                if matches:
+                    with contextlib.suppress(Exception):
+                        props["dipole"] = float(matches[-1])
+            elif "TOTAL DIPOLE MOMENT" in upper:
+                # ORCA variants can print dipole as vector components on this line.
+                matches = re.findall(r"(-?\d+(?:\.\d+)?)", stripped)
+                if matches:
+                    with contextlib.suppress(Exception):
+                        if len(matches) >= 3:
+                            x, y, z = map(float, matches[-3:])
+                            props["dipole"] = float(math.sqrt(x * x + y * y + z * z))
+                        else:
+                            props["dipole"] = float(matches[-1])
+            if "ISOTROPIC POLARIZABILITY" in upper or "ISOTROPIC POLARISABILITY" in upper:
+                matches = re.findall(r"(-?\d+(?:\.\d+)?)", stripped)
+                if matches:
+                    with contextlib.suppress(Exception):
+                        polar = float(matches[-1])
+                        props["polarizability"] = polar
+            if "ISOTROPIC ALPHA" in upper:
+                matches = re.findall(r"(-?\d+(?:\.\d+)?)", stripped)
+                if matches:
+                    with contextlib.suppress(Exception):
+                        polar = float(matches[-1])
+                        props["polarizability"] = polar
+            if in_absorption_table:
+                # ORCA absorption table rows can vary (e.g. "1 -> 2 ..." vs "1 ...").
+                # Find the first contiguous (eV, cm^-1, nm, fosc) tuple by value ranges.
+                num_tokens = re.findall(r"[-+]?\d*\.?\d+(?:[Ee][-+]?\d+)?", stripped)
+                if len(num_tokens) >= 4:
+                    values: list[float] = []
+                    for token in num_tokens:
+                        with contextlib.suppress(Exception):
+                            values.append(float(token))
+                    if len(values) >= 4:
+                        parsed = None
+                        for i in range(0, len(values) - 3):
+                            ev_val, cm_val, nm_val, f_val = values[i : i + 4]
+                            if not (0.05 <= ev_val <= 20.0):
+                                continue
+                            if not (500.0 <= cm_val <= 100000.0):
+                                continue
+                            if not (100.0 <= nm_val <= 5000.0):
+                                continue
+                            if not (0.0 <= f_val <= 10.0):
+                                continue
+                            parsed = (ev_val, nm_val, f_val)
+                            break
+                        if parsed is not None:
+                            tddft_states.append({"ev": parsed[0], "nm": parsed[1], "f": parsed[2]})
+            is_excited_state_line = (
+                ("EXCITED STATE" in upper and ("EV" in upper or "NM" in upper))
+                or bool(re.match(r"^STATE\s+\d+.*(?:EV|NM)", upper))
+            )
+            if is_excited_state_line:
+                # Accept ORCA format variants:
+                #   Excited State 1: ... 3.12 eV 397.5 nm f=0.1234
+                #   STATE 1: E=3.12 eV  fosc=0.1234
+                ev_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*eV", stripped, flags=re.I)
+                nm_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*nm", stripped, flags=re.I)
+                f_match = re.search(
+                    r"(?:f(?:osc)?\s*=\s*|oscillator\s*strength\s*[:=]\s*)([0-9]+(?:\.[0-9]+)?)",
+                    stripped,
+                    flags=re.I,
+                )
                 try:
                     state = {
                         "ev": float(ev_match.group(1)) if ev_match else None,
                         "nm": float(nm_match.group(1)) if nm_match else None,
                         "f": float(f_match.group(1)) if f_match else None,
                     }
+                    if state["nm"] is None and state["ev"] is not None and state["ev"] > 1e-12:
+                        state["nm"] = 1239.841984 / state["ev"]
                     if state["ev"] is not None or state["nm"] is not None:
                         tddft_states.append(state)
                 except Exception:
@@ -298,6 +458,19 @@ class OrcaExecutor(ExternalProgramExecutor):
                 props["lambda_max_nm"] = float(best["nm"])
             if best.get("f") is not None:
                 props["oscillator_strength"] = float(best["f"])
+        metadata["warning_lines"] = int(warning_lines)
+        logger.info(
+            "ORCA parse summary | terminated=%s scf=%s E=%s HOMO=%s LUMO=%s gap=%s lambda_max_nm=%s f=%s warnings=%d",
+            metadata.get("terminated_normally"),
+            metadata.get("scf_converged", "unknown"),
+            metadata.get("total_energy", "n/a"),
+            props.get("HOMO", "n/a"),
+            props.get("LUMO", "n/a"),
+            props.get("gap", "n/a"),
+            props.get("lambda_max_nm", "n/a"),
+            props.get("oscillator_strength", "n/a"),
+            int(warning_lines),
+        )
         return props, metadata
 
 

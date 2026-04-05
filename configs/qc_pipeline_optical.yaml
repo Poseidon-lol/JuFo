@@ -5,12 +5,12 @@ geometry:
   random_seed: 1337
   optimize: true
   use_etkdg: true
-  conformers: 10           # number of ETKDG conformers to generate
-  refine_forcefield: MMFF94 # constrained refinement per conformer
+  conformers: 10
+  refine_forcefield: MMFF94
   final_opt_forcefield: MMFF94
   final_opt_iterations: 200
-  rms_force_thresh: 0.5     # kcal/mol/Å threshold to stop early if converged
-  pick_lowest_energy: true  # select lowest MMFF conformer before DFT
+  rms_force_thresh: 0.5
+  pick_lowest_energy: true
 quantum:
   engine: orca
   executable: /workspace/orca_6_1_1_linux_x86-64_shared_openmpi418_avx2/orca
@@ -20,12 +20,13 @@ quantum:
   dispersion: D3BJ
   solvent_model: CPCM
   solvent: chloroform
-  properties: [HOMO, LUMO, gap, dipole, polarizability]
+  properties: [HOMO, LUMO, gap, lambda_max, oscillator_strength]
   charge: 0
   multiplicity: 1
   keywords:
     nprocs: 2
     maxcore: 1200
+    tddft_nroots: 12
   environment:
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
@@ -40,7 +41,7 @@ fallbacks:
     dispersion: null
 max_workers: 10
 poll_interval: 20.0
-work_dir: /workspace/qc_runs
+work_dir: /workspace/qc_runs_optical
 cleanup_workdir: true
 store_metadata: true
 allow_fallback: true

@@ -3,26 +3,26 @@ dataset:
   target_columns: [homo, lumo, gap]
   val_fraction: 0.1
 surrogate:
-  device: auto
+  device: cuda:0
   use_amp: true
-  compile: false
+  compile: true
   compile_mode: default
   compile_fullgraph: false
-  n_models: 3
-  epochs: 120
-  batch_size: 32
+  n_models: 5
+  epochs: 180
+  batch_size: 128
   lr: 0.001
   weight_decay: 0.0005
-  patience: 20
-  scheduler_patience: 10
-  dropout: 0.1
+  patience: 24
+  scheduler_patience: 12
+  dropout: 0.12
   loss: mae
-  hidden_dim: 192
-  message_layers: 4
+  hidden_dim: 320
+  message_layers: 7
   readout: mlp
-  readout_dim: 256
+  readout_dim: 384
   pooling: mean
   grad_clip: 1.0
   mc_dropout_samples: 4
   calibrate: true
-  save_dir: models/surrogate
+  save_dir: models/surrogate_heavy

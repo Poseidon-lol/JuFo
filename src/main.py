@@ -7,7 +7,7 @@ import logging
 import json
 import yaml
 from pathlib import Path
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Dict, Optional, Sequence, TYPE_CHECKING
 
 import pandas as pd
 import torch
@@ -23,8 +23,6 @@ else:
     raise RuntimeError("Could not locate project root containing src/")
 
 
-from src.data.dataset import load_dataframe, split_dataframe
-from src.models.ensemble import EnsembleConfig, SurrogateEnsemble
 from src.utils.config import load_config
 from src.utils.device import get_device
 from src.utils.log import setup_logging
@@ -35,145 +33,61 @@ if TYPE_CHECKING:
 
 
 def train_surrogate(args: argparse.Namespace) -> None:
-    cfg = load_config(args.config)
-    if args.device:
-        cfg.surrogate.device = args.device
-    if args.amp is not None:
-        cfg.surrogate.use_amp = bool(args.amp)
-    if args.compile is not None:
-        cfg.surrogate.compile = bool(args.compile)
-    if args.compile_mode:
-        cfg.surrogate.compile_mode = args.compile_mode
-    if args.compile_fullgraph is not None:
-        cfg.surrogate.compile_fullgraph = bool(args.compile_fullgraph)
-    data_cfg = cfg.dataset
-    df = load_dataframe(data_cfg.path)
-    target_columns = list(getattr(data_cfg, "target_columns", []))
-    if not target_columns:
-        raise ValueError("Config dataset.target_columns must list at least one property for surrogate training.")
-    missing = [col for col in target_columns if col not in df.columns]
-    if missing:
-        raise KeyError(f"Surrogate targets missing from dataframe: {missing}")
-    keep_cols = ["smiles"] + target_columns
-    df = df[keep_cols]
-    before = len(df)
-    df = df.dropna(subset=target_columns)
-    dropped = before - len(df)
-    if dropped > 0:
-        logging.getLogger(__name__).warning(
-            "Dropped %d rows with missing surrogate targets (remaining %d).", dropped, len(df)
-        )
-    split = split_dataframe(df, val_fraction=data_cfg.val_fraction, test_fraction=0.0, seed=args.seed)
-
-    ens_cfg = EnsembleConfig(
-        n_models=cfg.surrogate.n_models,
-        epochs=cfg.surrogate.epochs,
-        batch_size=cfg.surrogate.batch_size,
-        lr=cfg.surrogate.lr,
-        weight_decay=cfg.surrogate.weight_decay,
-        patience=getattr(cfg.surrogate, "patience", max(10, cfg.surrogate.epochs // 5)),
-        scheduler_patience=getattr(cfg.surrogate, "scheduler_patience", 15),
-        loss=cfg.surrogate.loss,
-        dropout=cfg.surrogate.dropout,
-        hidden_dim=getattr(cfg.surrogate, "hidden_dim", 128),
-        message_layers=getattr(cfg.surrogate, "message_layers", 3),
-        readout_dim=getattr(cfg.surrogate, "readout_dim", getattr(cfg.surrogate, "hidden_dim", 128)),
-        readout=getattr(cfg.surrogate, "readout", "mlp"),
-        pooling=getattr(cfg.surrogate, "pooling", "mean"),
-        grad_clip=getattr(cfg.surrogate, "grad_clip", 0.0),
-        mc_dropout_samples=getattr(cfg.surrogate, "mc_dropout_samples", 0),
-        calibrate=getattr(cfg.surrogate, "calibrate", True),
-        save_dir=Path(cfg.surrogate.save_dir),
-        device=getattr(cfg.surrogate, "device", None),
-        use_amp=bool(getattr(cfg.surrogate, "use_amp", False)),
-        compile=bool(getattr(cfg.surrogate, "compile", False)),
-        compile_mode=getattr(cfg.surrogate, "compile_mode", "default"),
-        compile_fullgraph=bool(getattr(cfg.surrogate, "compile_fullgraph", False)),
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "SchNet-only mode aktiv: 'train-surrogate' wird auf full SchNet umgeleitet."
     )
-    surrogate = SurrogateEnsemble(ens_cfg)
-    surrogate.fit(split.train, split.val)
-    surrogate.save_all()
-    print(f"Surrogate ensemble trained and saved to {cfg.surrogate.save_dir}")
+    cfg_path = str(getattr(args, "config", "") or "")
+    if cfg_path.endswith("train_conf.yaml"):
+        args.config = "configs/train_conf_3d_full.yaml"
+    train_surrogate_3d_full(args)
 
 def train_surrogate_3d(args: argparse.Namespace) -> None:
-    """Train a SchNet-based 3D surrogate on MolBlock geometries."""
-    import yaml
-    import pandas as pd
-    from src.data.featurization_3d import dataframe_to_3d_dataset
-    from src.models.schnet_surrogate import SchNetConfig, train_schnet
-
-    cfg = load_config(args.config)
-    if getattr(args, "device", None):
-        cfg.training.device = args.device
-    if getattr(args, "amp", None) is not None:
-        cfg.training.use_amp = bool(args.amp)
-    data_cfg = cfg.dataset
-    df = pd.read_csv(data_cfg.path)
-    target_columns = list(getattr(data_cfg, "target_columns", []))
-    if not target_columns:
-        raise ValueError("Config dataset.target_columns must list at least one property for surrogate training.")
-    mol_col = getattr(data_cfg, "mol_column", "mol")
-    smi_col = getattr(data_cfg, "smiles_column", getattr(data_cfg, "smile_column", "smile"))
-    ds = dataframe_to_3d_dataset(df, mol_col=mol_col, smiles_col=smi_col, target_cols=target_columns)
-    if len(ds) == 0:
-        raise ValueError("No valid 3D entries parsed from dataset; check mol_column/smiles_column.")
-    # split
-    val_fraction = float(getattr(data_cfg, "val_fraction", 0.1))
-    n_val = int(len(ds) * val_fraction)
-    train_ds = ds[n_val:]
-    val_ds = ds[:n_val] if n_val > 0 else None
-    train_cfg = cfg.training
-    model_cfg = cfg.model
-    live_cfg = getattr(train_cfg, "live_dashboard", None)
-    sch_cfg = SchNetConfig(
-        hidden_channels=model_cfg.hidden_channels,
-        num_filters=model_cfg.num_filters,
-        num_interactions=model_cfg.num_interactions,
-        num_gaussians=model_cfg.num_gaussians,
-        cutoff=model_cfg.cutoff,
-        readout=model_cfg.readout,
-        lr=train_cfg.lr,
-        weight_decay=train_cfg.weight_decay,
-        batch_size=train_cfg.batch_size,
-        epochs=train_cfg.epochs,
-        patience=train_cfg.patience,
-        device=getattr(train_cfg, "device", "cpu"),
-        save_dir=Path(train_cfg.save_dir),
-        target_names=target_columns,
-        live_dashboard=bool(getattr(live_cfg, "enabled", False)) if live_cfg is not None else False,
-        live_dashboard_path=(
-            Path(getattr(live_cfg, "path"))
-            if (live_cfg is not None and getattr(live_cfg, "path", None))
-            else None
-        ),
-        live_dashboard_refresh_ms=int(getattr(live_cfg, "refresh_ms", 900)) if live_cfg is not None else 900,
-        live_dashboard_local_view=bool(getattr(live_cfg, "local_view_enabled", False)) if live_cfg is not None else False,
-        live_dashboard_host=getattr(live_cfg, "local_view_host", "127.0.0.1") if live_cfg is not None else "127.0.0.1",
-        live_dashboard_port=int(getattr(live_cfg, "local_view_port", 0)) if live_cfg is not None else 0,
-        live_dashboard_open_browser=bool(getattr(live_cfg, "open_browser", True)) if live_cfg is not None else True,
+    """Backward-compatible alias for full SchNet training."""
+    logger = logging.getLogger(__name__)
+    logger.warning(
+        "SchNet-only mode aktiv: 'train-surrogate-3d' wird auf full SchNet umgeleitet."
     )
-    model, hist = train_schnet(train_ds, val_ds, target_dim=len(target_columns), config=sch_cfg)
-    print(f"3D surrogate trained; best model saved to {sch_cfg.save_dir/'schnet.pt'}")
+    cfg_path = str(getattr(args, "config", "") or "")
+    if cfg_path.endswith("train_conf_3d.yaml"):
+        args.config = "configs/train_conf_3d_full.yaml"
+    train_surrogate_3d_full(args)
 
 
 def train_surrogate_3d_full(args: argparse.Namespace) -> None:
     """Train a full SchNet (PyG) surrogate on MolBlock geometries."""
     import pandas as pd
     import numpy as np
-    from src.data.featurization_3d import dataframe_to_3d_dataset
+    from src.data.featurization_3d import dataframe_to_3d_dataset, qmsymex_xyz_dir_to_3d_dataset
     from src.models.schnet_full import RealSchNetConfig, train_schnet_full
 
     cfg = load_config(args.config)
     if getattr(args, "device", None):
         cfg.training.device = args.device
     data_cfg = cfg.dataset
-    df = pd.read_csv(data_cfg.path)
     target_columns = list(getattr(data_cfg, "target_columns", []))
     if not target_columns:
         raise ValueError("Config dataset.target_columns must list at least one property for surrogate training.")
-    mol_col = getattr(data_cfg, "mol_column", "mol")
-    smi_col = getattr(data_cfg, "smiles_column", getattr(data_cfg, "smile_column", "smile"))
-    ds = dataframe_to_3d_dataset(df, mol_col=mol_col, smiles_col=smi_col, target_cols=target_columns)
+    data_path = Path(getattr(data_cfg, "path"))
+    data_source = str(getattr(data_cfg, "source", "") or "").strip().lower()
+    if data_path.is_dir() or data_source in {"qmsymex", "qm_symex", "qmsymex_xyz"}:
+        ds = qmsymex_xyz_dir_to_3d_dataset(
+            data_path,
+            target_cols=target_columns,
+            transition_mode=str(getattr(data_cfg, "transition_mode", "best_f")),
+            lambda_min=getattr(data_cfg, "lambda_min", None),
+            lambda_max=getattr(data_cfg, "lambda_max", None),
+            f_min=getattr(data_cfg, "f_min", None),
+            charge=int(getattr(data_cfg, "charge", 0) or 0),
+            max_files=getattr(data_cfg, "max_files", None),
+            dedupe_smiles=bool(getattr(data_cfg, "dedupe_smiles", False)),
+            progress_every=int(getattr(data_cfg, "progress_every", 2000) or 2000),
+        )
+    else:
+        df = pd.read_csv(data_path)
+        mol_col = getattr(data_cfg, "mol_column", "mol")
+        smi_col = getattr(data_cfg, "smiles_column", getattr(data_cfg, "smile_column", "smile"))
+        ds = dataframe_to_3d_dataset(df, mol_col=mol_col, smiles_col=smi_col, target_cols=target_columns)
     if len(ds) == 0:
         raise ValueError("No valid 3D entries parsed from dataset; check mol_column/smiles_column.")
     # split
@@ -230,23 +144,77 @@ def train_surrogate_3d_full(args: argparse.Namespace) -> None:
 def _load_jtvae_from_ckpt(ckpt: Path, fragment_vocab_size: int, cond_dim: int) -> JTVAE:
     from src.models.jtvae_extended import JTVAE
 
-    state = torch.load(ckpt, map_location="cpu")
-    hidden_dim = state["encoder.tree_encoder.input_proj.weight"].shape[0]
-    node_feat_dim = state["encoder.tree_encoder.input_proj.weight"].shape[1]
-    graph_feat_dim = state["encoder.graph_encoder.input_proj.weight"].shape[1]
-    z_dim = state["encoder.fc_mu.weight"].shape[0]
-    # Prefer cond_dim inferred from checkpoint (property head output or fc_mu input size)
-    cond_dim_from_state = None
-    if "property_head.2.weight" in state:
-        cond_dim_from_state = state["property_head.2.weight"].shape[0]
-    else:
-        fused_dim = state["encoder.fc_mu.weight"].shape[1]
-        cond_dim_from_state = max(fused_dim - 2 * hidden_dim, 0)
-    if cond_dim_from_state is not None and cond_dim_from_state != cond_dim:
-        logging.getLogger(__name__).info(
-            "Adjusting cond_dim from %s to %s based on checkpoint.", cond_dim, cond_dim_from_state
+    raw = torch.load(ckpt, map_location="cpu")
+
+    # Support both plain state_dict checkpoints and training bundles.
+    if isinstance(raw, dict):
+        for container_key in ("state_dict", "model_state_dict", "generator_state_dict", "model"):
+            nested = raw.get(container_key)
+            if isinstance(nested, dict):
+                raw = nested
+                break
+    if not isinstance(raw, dict):
+        raise TypeError(f"Unsupported checkpoint format at {ckpt}: {type(raw)!r}")
+
+    def _normalize_keys(sd: dict) -> dict:
+        prefixes = ("module.", "_orig_mod.", "model.", "generator.")
+        normalized = {}
+        for key, value in sd.items():
+            if not isinstance(key, str):
+                continue
+            k = key.replace("._orig_mod.", ".")
+            changed = True
+            while changed:
+                changed = False
+                for prefix in prefixes:
+                    if k.startswith(prefix):
+                        k = k[len(prefix) :]
+                        changed = True
+            normalized[k] = value
+        return normalized
+
+    state = _normalize_keys(raw)
+
+    def _resolve_key(*candidates: str) -> Optional[str]:
+        for cand in candidates:
+            if cand in state:
+                return cand
+        for cand in candidates:
+            for key in state.keys():
+                if key.endswith(cand):
+                    return key
+        return None
+
+    tree_proj_key = _resolve_key("encoder.tree_encoder.input_proj.weight", "tree_encoder.input_proj.weight")
+    graph_proj_key = _resolve_key("encoder.graph_encoder.input_proj.weight", "graph_encoder.input_proj.weight")
+    fc_mu_key = _resolve_key("encoder.fc_mu.weight", "fc_mu.weight")
+    if tree_proj_key is None or graph_proj_key is None or fc_mu_key is None:
+        sample_keys = ", ".join(list(state.keys())[:20])
+        raise KeyError(
+            "JT-VAE checkpoint keys not recognized. "
+            f"Missing one of tree/graph/fc_mu keys in {ckpt}. Sample keys: {sample_keys}"
         )
-        cond_dim = cond_dim_from_state
+
+    hidden_dim = state[tree_proj_key].shape[0]
+    node_feat_dim = state[tree_proj_key].shape[1]
+    graph_feat_dim = state[graph_proj_key].shape[1]
+    z_dim = state[fc_mu_key].shape[0]
+    # Infer cond_dim in checkpoint for compatibility logging.
+    cond_dim_from_state = None
+    property_head_key = _resolve_key("property_head.2.weight")
+    if property_head_key is not None:
+        cond_dim_from_state = state[property_head_key].shape[0]
+    else:
+        fused_dim = state[fc_mu_key].shape[1]
+        cond_dim_from_state = max(fused_dim - 2 * hidden_dim, 0)
+    requested_cond_dim = int(cond_dim)
+    if cond_dim_from_state is not None and int(cond_dim_from_state) != requested_cond_dim:
+        logging.getLogger(__name__).info(
+            "JT-VAE checkpoint cond_dim=%s, requested cond_dim=%s. "
+            "Keeping requested cond_dim and loading only shape-compatible weights.",
+            int(cond_dim_from_state),
+            requested_cond_dim,
+        )
     positional_key = None
     for key in state.keys():
         if key.endswith("decoder.positional"):
@@ -254,7 +222,7 @@ def _load_jtvae_from_ckpt(ckpt: Path, fragment_vocab_size: int, cond_dim: int) -
             break
     max_tree_nodes = state[positional_key].shape[0] if positional_key else 12
     encoder_layer_indices = set()
-    pattern = re.compile(r"^encoder\.tree_encoder\.layers\.(\d+)\.")
+    pattern = re.compile(r"(?:^|.*\.)tree_encoder\.layers\.(\d+)\.")
     for key in state.keys():
         match = pattern.match(key)
         if match:
@@ -266,11 +234,48 @@ def _load_jtvae_from_ckpt(ckpt: Path, fragment_vocab_size: int, cond_dim: int) -
         fragment_vocab_size=fragment_vocab_size,
         z_dim=z_dim,
         hidden_dim=hidden_dim,
-        cond_dim=cond_dim,
+        cond_dim=requested_cond_dim,
         max_tree_nodes=max_tree_nodes,
         encoder_layers=encoder_layers,
     )
-    model.load_state_dict(state)
+    model_state = model.state_dict()
+    loadable_state = {}
+    skipped_shape = []
+    skipped_missing = []
+    for key, value in state.items():
+        if key not in model_state:
+            skipped_missing.append(key)
+            continue
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            skipped_shape.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        loadable_state[key] = value
+
+    missing_after_load, unexpected_after_load = model.load_state_dict(loadable_state, strict=False)
+    logger = logging.getLogger(__name__)
+    if skipped_shape:
+        preview = ", ".join(k for k, _, _ in skipped_shape[:6])
+        logger.warning(
+            "Skipped %d JT-VAE checkpoint tensors due to shape mismatch (likely cond_dim change): %s%s",
+            len(skipped_shape),
+            preview,
+            "..." if len(skipped_shape) > 6 else "",
+        )
+    if skipped_missing:
+        logger.info(
+            "Ignored %d checkpoint tensors not present in current JT-VAE graph.",
+            len(skipped_missing),
+        )
+    if unexpected_after_load:
+        logger.info(
+            "JT-VAE load returned %d unexpected tensor keys after filtering.",
+            len(unexpected_after_load),
+        )
+    if missing_after_load:
+        logger.info(
+            "JT-VAE initialized %d tensors from scratch (no compatible checkpoint tensor).",
+            len(missing_after_load),
+        )
     return model
 
 
@@ -514,12 +519,41 @@ def train_generator_3d(args: argparse.Namespace) -> None:
 def run_active_loop(args: argparse.Namespace) -> None:
     from src.active_learn.acq import AcquisitionConfig
     from src.active_learn.loop import ActiveLearningLoop, LoopConfig
+    from src.active_learn.objectives import (
+        apply_objective_profile,
+        load_objective_profile,
+        normalize_objective_mode,
+    )
     from src.active_learn.sched import SchedulerConfig
     from src.models.jtvae_extended import JTVAE
     import pandas as pd
     from torch_geometric.loader import DataLoader
 
     cfg = load_config(args.config)
+    objective_mode_raw = getattr(args, "objective_mode", None)
+    if objective_mode_raw is None:
+        objective_mode_raw = getattr(cfg.loop, "objective_mode", None)
+    objective_profile_raw = getattr(args, "objective_profile", None)
+    if objective_profile_raw is None:
+        objective_profile_raw = getattr(cfg.loop, "objective_profile_path", None)
+    if objective_mode_raw is not None or objective_profile_raw is not None:
+        objective_mode = normalize_objective_mode(objective_mode_raw or "red")
+        objective_profile, resolved_objective_path = load_objective_profile(
+            objective_mode,
+            objective_profile_raw,
+        )
+        applied = apply_objective_profile(
+            cfg,
+            objective_mode,
+            objective_profile,
+            resolved_objective_path,
+        )
+        logging.getLogger(__name__).info(
+            "Applied objective profile mode=%s from %s (sections=%s).",
+            objective_mode,
+            resolved_objective_path,
+            ",".join(sorted(k for k in applied.keys() if k not in {"mode", "profile_path"})) or "none",
+        )
     acq_cfg = AcquisitionConfig(**cfg.acquisition)
     sched_cfg = SchedulerConfig(**cfg.scheduler)
     loop_device_cfg = getattr(cfg.loop, "device", None)
@@ -531,6 +565,90 @@ def run_active_loop(args: argparse.Namespace) -> None:
         surrogate_device = args.surrogate_device
     if getattr(args, "generator_device", None):
         generator_device = args.generator_device
+
+    red_score_columns_cfg = getattr(cfg.loop, "red_score_columns", None)
+    if red_score_columns_cfg is None:
+        red_score_columns_cfg = getattr(cfg.loop, "objective_score_columns", LoopConfig.red_score_columns)
+    red_score_targets_cfg = getattr(cfg.loop, "red_score_targets", None)
+    if red_score_targets_cfg is None:
+        red_score_targets_cfg = getattr(cfg.loop, "objective_score_targets", LoopConfig.red_score_targets)
+    red_score_tolerances_cfg = getattr(cfg.loop, "red_score_tolerances", None)
+    if red_score_tolerances_cfg is None:
+        red_score_tolerances_cfg = getattr(cfg.loop, "objective_score_tolerances", LoopConfig.red_score_tolerances)
+    red_score_weights_cfg = getattr(cfg.loop, "red_score_weights", None)
+    if red_score_weights_cfg is None:
+        red_score_weights_cfg = getattr(cfg.loop, "objective_score_weights", LoopConfig.red_score_weights)
+    red_score_missing_penalty_cfg = getattr(cfg.loop, "red_score_missing_penalty", None)
+    if red_score_missing_penalty_cfg is None:
+        red_score_missing_penalty_cfg = getattr(
+            cfg.loop,
+            "objective_score_missing_penalty",
+            LoopConfig.red_score_missing_penalty,
+        )
+    red_score_pass_threshold_cfg = getattr(cfg.loop, "red_score_pass_threshold", None)
+    if red_score_pass_threshold_cfg is None:
+        red_score_pass_threshold_cfg = getattr(
+            cfg.loop,
+            "objective_score_pass_threshold",
+            LoopConfig.red_score_pass_threshold,
+        )
+    red_score_require_qc_success_cfg = getattr(cfg.loop, "red_score_require_qc_success", None)
+    if red_score_require_qc_success_cfg is None:
+        red_score_require_qc_success_cfg = getattr(
+            cfg.loop,
+            "objective_score_require_qc_success",
+            LoopConfig.red_score_require_qc_success,
+        )
+
+    objective_mode_cfg = str(getattr(cfg.loop, "objective_mode", "red") or "red")
+    objective_profile_path_cfg = getattr(cfg.loop, "objective_profile_path", None)
+    rl_cfg_raw = getattr(cfg.loop, "rl", {}) or {}
+    rl_cfg = dict(rl_cfg_raw)
+    if getattr(args, "rl_enabled", None) is not None:
+        rl_cfg["enabled"] = bool(args.rl_enabled)
+    if getattr(args, "rl_every_n_iterations", None) is not None:
+        rl_cfg["every_n_iterations"] = int(args.rl_every_n_iterations)
+    if getattr(args, "rl_steps_per_update", None) is not None:
+        rl_cfg["steps_per_update"] = int(args.rl_steps_per_update)
+    if getattr(args, "rl_batch_size", None) is not None:
+        rl_cfg["batch_size"] = int(args.rl_batch_size)
+    if getattr(args, "rl_lr", None) is not None:
+        rl_cfg["lr"] = float(args.rl_lr)
+    if getattr(args, "rl_algorithm", None) is not None:
+        rl_cfg["algorithm"] = str(args.rl_algorithm)
+    if getattr(args, "rl_entropy_weight", None) is not None:
+        rl_cfg["entropy_weight"] = float(args.rl_entropy_weight)
+    if getattr(args, "rl_baseline_momentum", None) is not None:
+        rl_cfg["baseline_momentum"] = float(args.rl_baseline_momentum)
+    if getattr(args, "rl_reward_clip", None) is not None:
+        rl_cfg["reward_clip"] = float(args.rl_reward_clip)
+    if getattr(args, "rl_normalize_advantage", None) is not None:
+        rl_cfg["normalize_advantage"] = bool(args.rl_normalize_advantage)
+    if getattr(args, "rl_use_qc_top_k", None) is not None:
+        rl_cfg["use_qc_top_k"] = bool(args.rl_use_qc_top_k)
+    if getattr(args, "rl_qc_top_k", None) is not None:
+        rl_cfg["qc_top_k"] = int(args.rl_qc_top_k)
+    if getattr(args, "rl_warmup_iterations", None) is not None:
+        rl_cfg["warmup_iterations"] = int(args.rl_warmup_iterations)
+    if getattr(args, "rl_max_grad_norm", None) is not None:
+        rl_cfg["max_grad_norm"] = float(args.rl_max_grad_norm)
+    if getattr(args, "rl_checkpoint_every", None) is not None:
+        rl_cfg["checkpoint_every"] = int(args.rl_checkpoint_every)
+    if getattr(args, "rl_value_loss_weight", None) is not None:
+        rl_cfg["value_loss_weight"] = float(args.rl_value_loss_weight)
+    if getattr(args, "rl_ppo_clip_ratio", None) is not None:
+        rl_cfg["ppo_clip_ratio"] = float(args.rl_ppo_clip_ratio)
+    if getattr(args, "rl_ppo_epochs", None) is not None:
+        rl_cfg["ppo_epochs"] = int(args.rl_ppo_epochs)
+    if getattr(args, "rl_ppo_minibatch_size", None) is not None:
+        rl_cfg["ppo_minibatch_size"] = int(args.rl_ppo_minibatch_size)
+    if getattr(args, "rl_ppo_target_kl", None) is not None:
+        rl_cfg["ppo_target_kl"] = float(args.rl_ppo_target_kl)
+    rl_baseline_momentum_cfg = rl_cfg.get("baseline_momentum", LoopConfig.rl_baseline_momentum)
+    rl_entropy_weight_cfg = rl_cfg.get("entropy_weight", LoopConfig.rl_entropy_weight)
+    rl_lr_cfg = rl_cfg.get("lr", LoopConfig.rl_lr)
+    rl_reward_clip_cfg = rl_cfg.get("reward_clip", LoopConfig.rl_reward_clip)
+
     loop_cfg = LoopConfig(
         batch_size=cfg.loop.batch_size,
         acquisition=acq_cfg,
@@ -546,6 +664,180 @@ def run_active_loop(args: argparse.Namespace) -> None:
         diversity_metric=getattr(cfg.loop, "diversity_metric", "tanimoto"),
         generator_refresh=dict(getattr(cfg.loop, "generator_refresh", {})),
         property_aliases=dict(getattr(cfg.loop, "property_aliases", {})),
+        rl_enabled=bool(rl_cfg.get("enabled", LoopConfig.rl_enabled)),
+        rl_every_n_iterations=max(
+            1,
+            int(rl_cfg.get("every_n_iterations", LoopConfig.rl_every_n_iterations) or 1),
+        ),
+        rl_steps_per_update=max(
+            1,
+            int(rl_cfg.get("steps_per_update", LoopConfig.rl_steps_per_update) or 1),
+        ),
+        rl_batch_size=max(
+            1,
+            int(rl_cfg.get("batch_size", LoopConfig.rl_batch_size) or 1),
+        ),
+        rl_lr=float(LoopConfig.rl_lr if rl_lr_cfg is None else rl_lr_cfg),
+        rl_algorithm=str(rl_cfg.get("algorithm", LoopConfig.rl_algorithm) or LoopConfig.rl_algorithm),
+        rl_entropy_weight=float(
+            LoopConfig.rl_entropy_weight if rl_entropy_weight_cfg is None else rl_entropy_weight_cfg
+        ),
+        rl_baseline_momentum=float(
+            LoopConfig.rl_baseline_momentum
+            if rl_baseline_momentum_cfg is None
+            else rl_baseline_momentum_cfg
+        ),
+        rl_reward_clip=(
+            None
+            if rl_reward_clip_cfg is None
+            else float(rl_reward_clip_cfg)
+        ),
+        rl_normalize_advantage=bool(
+            rl_cfg.get("normalize_advantage", LoopConfig.rl_normalize_advantage)
+        ),
+        rl_use_qc_top_k=bool(rl_cfg.get("use_qc_top_k", LoopConfig.rl_use_qc_top_k)),
+        rl_qc_top_k=max(0, int(rl_cfg.get("qc_top_k", LoopConfig.rl_qc_top_k) or 0)),
+        rl_warmup_iterations=max(
+            0,
+            int(rl_cfg.get("warmup_iterations", LoopConfig.rl_warmup_iterations) or 0),
+        ),
+        rl_max_grad_norm=(
+            None
+            if rl_cfg.get("max_grad_norm", LoopConfig.rl_max_grad_norm) is None
+            else float(rl_cfg.get("max_grad_norm", LoopConfig.rl_max_grad_norm))
+        ),
+        rl_checkpoint_every=max(
+            1,
+            int(rl_cfg.get("checkpoint_every", LoopConfig.rl_checkpoint_every) or 1),
+        ),
+        rl_value_loss_weight=float(
+            rl_cfg.get("value_loss_weight", LoopConfig.rl_value_loss_weight)
+            if rl_cfg.get("value_loss_weight", LoopConfig.rl_value_loss_weight) is not None
+            else LoopConfig.rl_value_loss_weight
+        ),
+        rl_actor_lr=(
+            None
+            if rl_cfg.get("actor_lr", LoopConfig.rl_actor_lr) is None
+            else float(rl_cfg.get("actor_lr", LoopConfig.rl_actor_lr))
+        ),
+        rl_critic_lr=(
+            None
+            if rl_cfg.get("critic_lr", LoopConfig.rl_critic_lr) is None
+            else float(rl_cfg.get("critic_lr", LoopConfig.rl_critic_lr))
+        ),
+        rl_anchor_weight=float(
+            rl_cfg.get("anchor_weight", LoopConfig.rl_anchor_weight)
+            if rl_cfg.get("anchor_weight", LoopConfig.rl_anchor_weight) is not None
+            else LoopConfig.rl_anchor_weight
+        ),
+        rl_reward_running_norm=bool(
+            rl_cfg.get("reward_running_norm", LoopConfig.rl_reward_running_norm)
+        ),
+        rl_reward_norm_eps=float(
+            rl_cfg.get("reward_norm_eps", LoopConfig.rl_reward_norm_eps)
+            if rl_cfg.get("reward_norm_eps", LoopConfig.rl_reward_norm_eps) is not None
+            else LoopConfig.rl_reward_norm_eps
+        ),
+        rl_reward_norm_clip=(
+            None
+            if rl_cfg.get("reward_norm_clip", LoopConfig.rl_reward_norm_clip) is None
+            else float(rl_cfg.get("reward_norm_clip", LoopConfig.rl_reward_norm_clip))
+        ),
+        rl_entropy_weight_start=(
+            None
+            if rl_cfg.get("entropy_weight_start", LoopConfig.rl_entropy_weight_start) is None
+            else float(rl_cfg.get("entropy_weight_start", LoopConfig.rl_entropy_weight_start))
+        ),
+        rl_entropy_weight_end=(
+            None
+            if rl_cfg.get("entropy_weight_end", LoopConfig.rl_entropy_weight_end) is None
+            else float(rl_cfg.get("entropy_weight_end", LoopConfig.rl_entropy_weight_end))
+        ),
+        rl_entropy_decay_updates=max(
+            1,
+            int(rl_cfg.get("entropy_decay_updates", LoopConfig.rl_entropy_decay_updates) or 1),
+        ),
+        rl_ppo_clip_ratio=float(
+            rl_cfg.get("ppo_clip_ratio", LoopConfig.rl_ppo_clip_ratio)
+            if rl_cfg.get("ppo_clip_ratio", LoopConfig.rl_ppo_clip_ratio) is not None
+            else LoopConfig.rl_ppo_clip_ratio
+        ),
+        rl_ppo_epochs=max(
+            1,
+            int(rl_cfg.get("ppo_epochs", LoopConfig.rl_ppo_epochs) or 1),
+        ),
+        rl_ppo_minibatch_size=(
+            None
+            if rl_cfg.get("ppo_minibatch_size", LoopConfig.rl_ppo_minibatch_size) is None
+            else max(1, int(rl_cfg.get("ppo_minibatch_size", LoopConfig.rl_ppo_minibatch_size)))
+        ),
+        rl_ppo_target_kl=(
+            None
+            if rl_cfg.get("ppo_target_kl", LoopConfig.rl_ppo_target_kl) is None
+            else float(rl_cfg.get("ppo_target_kl", LoopConfig.rl_ppo_target_kl))
+        ),
+        rl_ppo_value_clip_range=(
+            None
+            if rl_cfg.get("ppo_value_clip_range", LoopConfig.rl_ppo_value_clip_range) is None
+            else float(rl_cfg.get("ppo_value_clip_range", LoopConfig.rl_ppo_value_clip_range))
+        ),
+        rl_ppo_adaptive_kl=bool(
+            rl_cfg.get("ppo_adaptive_kl", LoopConfig.rl_ppo_adaptive_kl)
+        ),
+        rl_ppo_adaptive_kl_high_mult=float(
+            rl_cfg.get("ppo_adaptive_kl_high_mult", LoopConfig.rl_ppo_adaptive_kl_high_mult)
+            if rl_cfg.get("ppo_adaptive_kl_high_mult", LoopConfig.rl_ppo_adaptive_kl_high_mult) is not None
+            else LoopConfig.rl_ppo_adaptive_kl_high_mult
+        ),
+        rl_ppo_adaptive_kl_low_mult=float(
+            rl_cfg.get("ppo_adaptive_kl_low_mult", LoopConfig.rl_ppo_adaptive_kl_low_mult)
+            if rl_cfg.get("ppo_adaptive_kl_low_mult", LoopConfig.rl_ppo_adaptive_kl_low_mult) is not None
+            else LoopConfig.rl_ppo_adaptive_kl_low_mult
+        ),
+        rl_ppo_lr_down_factor=float(
+            rl_cfg.get("ppo_lr_down_factor", LoopConfig.rl_ppo_lr_down_factor)
+            if rl_cfg.get("ppo_lr_down_factor", LoopConfig.rl_ppo_lr_down_factor) is not None
+            else LoopConfig.rl_ppo_lr_down_factor
+        ),
+        rl_ppo_lr_up_factor=float(
+            rl_cfg.get("ppo_lr_up_factor", LoopConfig.rl_ppo_lr_up_factor)
+            if rl_cfg.get("ppo_lr_up_factor", LoopConfig.rl_ppo_lr_up_factor) is not None
+            else LoopConfig.rl_ppo_lr_up_factor
+        ),
+        rl_ppo_clip_down_factor=float(
+            rl_cfg.get("ppo_clip_down_factor", LoopConfig.rl_ppo_clip_down_factor)
+            if rl_cfg.get("ppo_clip_down_factor", LoopConfig.rl_ppo_clip_down_factor) is not None
+            else LoopConfig.rl_ppo_clip_down_factor
+        ),
+        rl_ppo_clip_up_factor=float(
+            rl_cfg.get("ppo_clip_up_factor", LoopConfig.rl_ppo_clip_up_factor)
+            if rl_cfg.get("ppo_clip_up_factor", LoopConfig.rl_ppo_clip_up_factor) is not None
+            else LoopConfig.rl_ppo_clip_up_factor
+        ),
+        rl_ppo_actor_lr_min=(
+            None
+            if rl_cfg.get("ppo_actor_lr_min", LoopConfig.rl_ppo_actor_lr_min) is None
+            else float(rl_cfg.get("ppo_actor_lr_min", LoopConfig.rl_ppo_actor_lr_min))
+        ),
+        rl_ppo_actor_lr_max=(
+            None
+            if rl_cfg.get("ppo_actor_lr_max", LoopConfig.rl_ppo_actor_lr_max) is None
+            else float(rl_cfg.get("ppo_actor_lr_max", LoopConfig.rl_ppo_actor_lr_max))
+        ),
+        rl_ppo_clip_ratio_min=float(
+            rl_cfg.get("ppo_clip_ratio_min", LoopConfig.rl_ppo_clip_ratio_min)
+            if rl_cfg.get("ppo_clip_ratio_min", LoopConfig.rl_ppo_clip_ratio_min) is not None
+            else LoopConfig.rl_ppo_clip_ratio_min
+        ),
+        rl_ppo_clip_ratio_max=float(
+            rl_cfg.get("ppo_clip_ratio_max", LoopConfig.rl_ppo_clip_ratio_max)
+            if rl_cfg.get("ppo_clip_ratio_max", LoopConfig.rl_ppo_clip_ratio_max) is not None
+            else LoopConfig.rl_ppo_clip_ratio_max
+        ),
+        objective_mode=objective_mode_cfg,
+        objective_profile_path=(
+            str(objective_profile_path_cfg) if objective_profile_path_cfg is not None else None
+        ),
         max_pool_eval=getattr(cfg.loop, "max_pool_eval", None),
         predict_batch_size=getattr(cfg.loop, "predict_batch_size", None),
         predict_mc_samples=getattr(cfg.loop, "predict_mc_samples", None),
@@ -580,12 +872,256 @@ def run_active_loop(args: argparse.Namespace) -> None:
         max_branch_degree=getattr(cfg.loop, "max_branch_degree", None),
         max_charged_atoms=getattr(cfg.loop, "max_charged_atoms", None),
         property_filters=dict(getattr(cfg.loop, "property_filters", {})),
+        qc_extra_properties=tuple(getattr(cfg.loop, "qc_extra_properties", ())),
+        objective_gate_min_lambda_max_nm=getattr(cfg.loop, "objective_gate_min_lambda_max_nm", None),
+        objective_gate_max_lambda_max_nm=getattr(cfg.loop, "objective_gate_max_lambda_max_nm", None),
+        objective_gate_min_oscillator_strength=getattr(
+            cfg.loop,
+            "objective_gate_min_oscillator_strength",
+            None,
+        ),
+        objective_gate_max_oscillator_strength=getattr(
+            cfg.loop,
+            "objective_gate_max_oscillator_strength",
+            None,
+        ),
+        max_lambda_max_nm=getattr(cfg.loop, "max_lambda_max_nm", None),
+        max_oscillator_strength=getattr(cfg.loop, "max_oscillator_strength", None),
+        min_lambda_max_nm=getattr(cfg.loop, "min_lambda_max_nm", None),
+        min_oscillator_strength=getattr(cfg.loop, "min_oscillator_strength", None),
         require_neutral=bool(getattr(cfg.loop, "require_neutral", True)),
         sa_score_max=getattr(cfg.loop, "sa_score_max", None),
         physchem_filters=dict(getattr(cfg.loop, "physchem_filters", {})),
         scaffold_unique=bool(getattr(cfg.loop, "scaffold_unique", False)),
         live_dashboard=dict(getattr(cfg.loop, "live_dashboard", {})),
         auto_relax_filters=bool(getattr(cfg.loop, "auto_relax_filters", LoopConfig.auto_relax_filters)),
+        save_diagnostics=bool(getattr(cfg.loop, "save_diagnostics", False)),
+        diagnostics_every=int(getattr(cfg.loop, "diagnostics_every", 0)),
+        diagnostics_max_points=int(getattr(cfg.loop, "diagnostics_max_points", 12000)),
+        optical_score_weight=float(getattr(cfg.loop, "optical_score_weight", LoopConfig.optical_score_weight) or 0.0),
+        optical_target_columns=tuple(
+            getattr(cfg.loop, "optical_target_columns", LoopConfig.optical_target_columns)
+        ),
+        optical_targets=(
+            None
+            if getattr(cfg.loop, "optical_targets", LoopConfig.optical_targets) is None
+            else tuple(
+                float(v) for v in getattr(cfg.loop, "optical_targets", LoopConfig.optical_targets)
+            )
+        ),
+        optical_tolerances=(
+            None
+            if getattr(cfg.loop, "optical_tolerances", LoopConfig.optical_tolerances) is None
+            else tuple(
+                float(v) for v in getattr(cfg.loop, "optical_tolerances", LoopConfig.optical_tolerances)
+            )
+        ),
+        optical_weights=(
+            None
+            if getattr(cfg.loop, "optical_weights", LoopConfig.optical_weights) is None
+            else tuple(
+                float(v) for v in getattr(cfg.loop, "optical_weights", LoopConfig.optical_weights)
+            )
+        ),
+        optical_beta=float(getattr(cfg.loop, "optical_beta", LoopConfig.optical_beta) or 0.0),
+        optical_weight_schedule=tuple(
+            getattr(cfg.loop, "optical_weight_schedule", LoopConfig.optical_weight_schedule)
+        ),
+        optical_predict_batch_size=getattr(cfg.loop, "optical_predict_batch_size", None),
+        optical_predict_mc_samples=getattr(cfg.loop, "optical_predict_mc_samples", None),
+        min_labels_for_optical=int(getattr(cfg.loop, "min_labels_for_optical", 0) or 0),
+        optical_retrain_every=int(getattr(cfg.loop, "optical_retrain_every", 0) or 0),
+        optical_retrain_min_labels=int(
+            getattr(cfg.loop, "optical_retrain_min_labels", LoopConfig.optical_retrain_min_labels)
+            or LoopConfig.optical_retrain_min_labels
+        ),
+        optical_retrain_val_fraction=float(
+            getattr(
+                cfg.loop,
+                "optical_retrain_val_fraction",
+                LoopConfig.optical_retrain_val_fraction,
+            )
+            or LoopConfig.optical_retrain_val_fraction
+        ),
+        optical_retrain_on_success_only=bool(
+            getattr(
+                cfg.loop,
+                "optical_retrain_on_success_only",
+                LoopConfig.optical_retrain_on_success_only,
+            )
+        ),
+        optical_incremental_path=getattr(
+            cfg.loop,
+            "optical_incremental_path",
+            LoopConfig.optical_incremental_path,
+        ),
+        optical_incremental_dedupe_on=tuple(
+            getattr(
+                cfg.loop,
+                "optical_incremental_dedupe_on",
+                LoopConfig.optical_incremental_dedupe_on,
+            )
+        ),
+        optical_incremental_require_all_targets=bool(
+            getattr(
+                cfg.loop,
+                "optical_incremental_require_all_targets",
+                LoopConfig.optical_incremental_require_all_targets,
+            )
+        ),
+        oscillator_score_weight=float(
+            getattr(cfg.loop, "oscillator_score_weight", LoopConfig.oscillator_score_weight) or 0.0
+        ),
+        oscillator_target_columns=tuple(
+            getattr(cfg.loop, "oscillator_target_columns", LoopConfig.oscillator_target_columns)
+        ),
+        oscillator_targets=(
+            None
+            if getattr(cfg.loop, "oscillator_targets", LoopConfig.oscillator_targets) is None
+            else tuple(
+                float(v) for v in getattr(cfg.loop, "oscillator_targets", LoopConfig.oscillator_targets)
+            )
+        ),
+        oscillator_tolerances=(
+            None
+            if getattr(cfg.loop, "oscillator_tolerances", LoopConfig.oscillator_tolerances) is None
+            else tuple(
+                float(v) for v in getattr(cfg.loop, "oscillator_tolerances", LoopConfig.oscillator_tolerances)
+            )
+        ),
+        oscillator_weights=(
+            None
+            if getattr(cfg.loop, "oscillator_weights", LoopConfig.oscillator_weights) is None
+            else tuple(
+                float(v) for v in getattr(cfg.loop, "oscillator_weights", LoopConfig.oscillator_weights)
+            )
+        ),
+        oscillator_beta=float(getattr(cfg.loop, "oscillator_beta", LoopConfig.oscillator_beta) or 0.0),
+        oscillator_predict_batch_size=getattr(cfg.loop, "oscillator_predict_batch_size", None),
+        oscillator_predict_mc_samples=getattr(cfg.loop, "oscillator_predict_mc_samples", None),
+        min_labels_for_oscillator=int(getattr(cfg.loop, "min_labels_for_oscillator", 0) or 0),
+        oscillator_retrain_every=int(getattr(cfg.loop, "oscillator_retrain_every", 0) or 0),
+        oscillator_retrain_min_labels=int(
+            getattr(cfg.loop, "oscillator_retrain_min_labels", LoopConfig.oscillator_retrain_min_labels)
+            or LoopConfig.oscillator_retrain_min_labels
+        ),
+        oscillator_retrain_val_fraction=float(
+            getattr(
+                cfg.loop,
+                "oscillator_retrain_val_fraction",
+                LoopConfig.oscillator_retrain_val_fraction,
+            )
+            or LoopConfig.oscillator_retrain_val_fraction
+        ),
+        oscillator_retrain_on_success_only=bool(
+            getattr(
+                cfg.loop,
+                "oscillator_retrain_on_success_only",
+                LoopConfig.oscillator_retrain_on_success_only,
+            )
+        ),
+        objective_score_columns=tuple(
+            getattr(cfg.loop, "objective_score_columns", red_score_columns_cfg)
+        ),
+        objective_score_targets=(
+            None
+            if getattr(cfg.loop, "objective_score_targets", red_score_targets_cfg) is None
+            else tuple(
+                float(v)
+                for v in getattr(cfg.loop, "objective_score_targets", red_score_targets_cfg)
+            )
+        ),
+        objective_score_tolerances=(
+            None
+            if getattr(cfg.loop, "objective_score_tolerances", red_score_tolerances_cfg) is None
+            else tuple(
+                float(v)
+                for v in getattr(cfg.loop, "objective_score_tolerances", red_score_tolerances_cfg)
+            )
+        ),
+        objective_score_weights=(
+            None
+            if getattr(cfg.loop, "objective_score_weights", red_score_weights_cfg) is None
+            else tuple(
+                float(v)
+                for v in getattr(cfg.loop, "objective_score_weights", red_score_weights_cfg)
+            )
+        ),
+        objective_score_missing_penalty=float(
+            red_score_missing_penalty_cfg
+            if getattr(cfg.loop, "objective_score_missing_penalty", red_score_missing_penalty_cfg) is None
+            else getattr(cfg.loop, "objective_score_missing_penalty", red_score_missing_penalty_cfg)
+        ),
+        objective_score_pass_threshold=getattr(
+            cfg.loop,
+            "objective_score_pass_threshold",
+            red_score_pass_threshold_cfg,
+        ),
+        objective_score_require_qc_success=bool(
+            getattr(
+                cfg.loop,
+                "objective_score_require_qc_success",
+                red_score_require_qc_success_cfg,
+            )
+        ),
+        red_score_columns=tuple(red_score_columns_cfg),
+        red_score_targets=(
+            None
+            if red_score_targets_cfg is None
+            else tuple(
+                float(v) for v in red_score_targets_cfg
+            )
+        ),
+        red_score_tolerances=(
+            None
+            if red_score_tolerances_cfg is None
+            else tuple(
+                float(v)
+                for v in red_score_tolerances_cfg
+            )
+        ),
+        red_score_weights=(
+            None
+            if red_score_weights_cfg is None
+            else tuple(
+                float(v) for v in red_score_weights_cfg
+            )
+        ),
+        red_score_missing_penalty=float(
+            LoopConfig.red_score_missing_penalty
+            if red_score_missing_penalty_cfg is None
+            else red_score_missing_penalty_cfg
+        ),
+        red_score_pass_threshold=red_score_pass_threshold_cfg,
+        red_score_require_qc_success=bool(red_score_require_qc_success_cfg),
+        early_stop_no_improve_iterations=int(
+            getattr(
+                cfg.loop,
+                "early_stop_no_improve_iterations",
+                LoopConfig.early_stop_no_improve_iterations,
+            )
+            or LoopConfig.early_stop_no_improve_iterations
+        ),
+        early_stop_min_delta=float(
+            getattr(cfg.loop, "early_stop_min_delta", LoopConfig.early_stop_min_delta)
+            or LoopConfig.early_stop_min_delta
+        ),
+        export_top_k=int(getattr(cfg.loop, "export_top_k", LoopConfig.export_top_k) or LoopConfig.export_top_k),
+        export_sort_column=str(
+            getattr(cfg.loop, "export_sort_column", LoopConfig.export_sort_column)
+            or LoopConfig.export_sort_column
+        ),
+        export_require_qc_success=bool(
+            getattr(cfg.loop, "export_require_qc_success", LoopConfig.export_require_qc_success)
+        ),
+        export_require_red_pass=bool(
+            getattr(cfg.loop, "export_require_red_pass", LoopConfig.export_require_red_pass)
+        ),
+        export_top_candidates_path=getattr(
+            cfg.loop,
+            "export_top_candidates_path",
+            LoopConfig.export_top_candidates_path,
+        ),
     )
 
     labelled = pd.read_csv(cfg.data.labelled)
@@ -621,6 +1157,11 @@ def run_active_loop(args: argparse.Namespace) -> None:
             self.is_schnet = True
             self.train_params = train_params or {}
             self.mc_samples_default = int(self.train_params.get("mc_samples", 0))
+            self.predict_num_workers = max(0, int(getattr(cfg.loop, "predict_num_workers", 0) or 0))
+            self.predict_pin_memory = bool(
+                getattr(cfg.loop, "predict_pin_memory", self.device.type == "cuda")
+            )
+            self.predict_amp = bool(getattr(cfg.loop, "predict_amp", self.device.type == "cuda"))
 
             # move models to device
             moved = []
@@ -639,7 +1180,16 @@ def run_active_loop(args: argparse.Namespace) -> None:
 
             if not isinstance(graphs, (list, tuple)):
                 graphs = [graphs]
-            loader = DataLoader(graphs, batch_size=batch_size or self.batch_size, shuffle=False)
+            loader_kwargs = {
+                "batch_size": batch_size or self.batch_size,
+                "shuffle": False,
+                "num_workers": self.predict_num_workers,
+                "pin_memory": self.predict_pin_memory,
+            }
+            if self.predict_num_workers > 0:
+                loader_kwargs["persistent_workers"] = True
+                loader_kwargs["prefetch_factor"] = 4
+            loader = DataLoader(graphs, **loader_kwargs)
             mc = mc_samples
             if mc is None:
                 mc = self.mc_samples_default
@@ -649,12 +1199,20 @@ def run_active_loop(args: argparse.Namespace) -> None:
                 is_training = model.training
                 try:
                     model.train(mc > 1)
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         for _ in range(mc):
                             preds = []
                             for batch in loader:
-                                batch = batch.to(self.device)
-                                preds.append(model(batch.z, batch.pos, getattr(batch, "batch", None)).detach().cpu())
+                                batch = batch.to(
+                                    self.device,
+                                    non_blocking=bool(self.predict_pin_memory and self.device.type == "cuda"),
+                                )
+                                if self.predict_amp and self.device.type == "cuda":
+                                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                                        out = model(batch.z, batch.pos, getattr(batch, "batch", None))
+                                else:
+                                    out = model(batch.z, batch.pos, getattr(batch, "batch", None))
+                                preds.append(out.detach().cpu())
                             all_passes.append(torch.cat(preds, dim=0))
                 finally:
                     if not is_training:
@@ -666,8 +1224,7 @@ def run_active_loop(args: argparse.Namespace) -> None:
 
         def fit(self, train_df, val_df=None):
             from src.data.featurization_3d import dataframe_to_3d_dataset
-            from src.models.schnet_surrogate import SchNetConfig, train_schnet
-            import math
+            from src.models.schnet_full import RealSchNetConfig, train_schnet_full
 
             target_cols = [c for c in self.target_columns if c in train_df.columns]
             ds_train = dataframe_to_3d_dataset(train_df, mol_col="mol", smiles_col="smiles", target_cols=target_cols)
@@ -678,8 +1235,6 @@ def run_active_loop(args: argparse.Namespace) -> None:
                 logger.warning("SchNet retrain skipped: no valid 3D entries in training split.")
                 return
 
-            # Determine if we train pseudo or full SchNet
-            is_full = any(m.__class__.__name__ == "RealSchNetModel" for m in self.models)
             n_models = int(self.train_params.get("n_models", len(self.models)))
             base_cfg = None
             if hasattr(self.models[0], "cfg"):
@@ -687,115 +1242,147 @@ def run_active_loop(args: argparse.Namespace) -> None:
 
             new_models = []
             for idx in range(max(1, n_models)):
-                if is_full:
-                    from src.models.schnet_full import RealSchNetConfig, train_schnet_full
-
-                    params = {
-                        "hidden_channels": getattr(base_cfg, "hidden_channels", 128) if base_cfg else 128,
-                        "num_filters": getattr(base_cfg, "num_filters", 128) if base_cfg else 128,
-                        "num_interactions": getattr(base_cfg, "num_interactions", 6) if base_cfg else 6,
-                        "num_gaussians": getattr(base_cfg, "num_gaussians", 50) if base_cfg else 50,
-                        "cutoff": getattr(base_cfg, "cutoff", 10.0) if base_cfg else 10.0,
-                        "readout": getattr(base_cfg, "readout", "add") if base_cfg else "add",
-                        "lr": self.train_params.get("lr", 1e-3),
-                        "weight_decay": self.train_params.get("weight_decay", 0.0),
-                        "batch_size": self.train_params.get("batch_size", 16),
-                        "epochs": self.train_params.get("epochs", 30),
-                        "patience": self.train_params.get("patience", 5),
-                        "scheduler_patience": self.train_params.get(
-                            "scheduler_patience", getattr(base_cfg, "scheduler_patience", 10)
-                        ),
-                        "use_amp": bool(self.train_params.get("use_amp", getattr(base_cfg, "use_amp", False))),
-                        "grad_clip": float(self.train_params.get("grad_clip", getattr(base_cfg, "grad_clip", 0.0))),
-                        "loss": self.train_params.get("loss", getattr(base_cfg, "loss", "l1")),
-                        "target_weights": self.train_params.get("target_weights", getattr(base_cfg, "target_weights", None)),
-                        "head_dropout": float(self.train_params.get("head_dropout", getattr(base_cfg, "head_dropout", 0.0))),
-                        "interaction_dropout": float(self.train_params.get("interaction_dropout", getattr(base_cfg, "interaction_dropout", 0.0))),
-                        "num_workers": int(self.train_params.get("num_workers", getattr(base_cfg, "num_workers", 0))),
-                        "pin_memory": bool(self.train_params.get("pin_memory", getattr(base_cfg, "pin_memory", False))),
-                        "device": str(self.device),
-                        "save_dir": Path(self.train_params.get("save_dir", getattr(base_cfg, "save_dir", "models/surrogate_3d_full"))),
-                    }
-                    sch_cfg = RealSchNetConfig(**params)
-                    new_model, _ = train_schnet_full(
-                        ds_train,
-                        ds_val,
-                        target_dim=len(target_cols),
-                        config=sch_cfg,
-                        save_path=Path(sch_cfg.save_dir) / f"schnet_full_member_{idx:02d}.pt",
-                        seed=int(self.train_params.get("seed", 1337)) + idx,
-                    )
-                else:
-                    params = {
-                        "hidden_channels": getattr(base_cfg, "hidden_channels", 128) if base_cfg else 128,
-                        "lr": self.train_params.get("lr", 1e-3),
-                        "weight_decay": self.train_params.get("weight_decay", 1e-4),
-                        "batch_size": self.train_params.get("batch_size", 32),
-                        "epochs": self.train_params.get("epochs", 20),
-                        "patience": self.train_params.get("patience", 5),
-                        "device": str(self.device),
-                        "save_dir": Path(self.train_params.get("save_dir", getattr(base_cfg, "save_dir", "models/surrogate_3d"))),
-                    }
-                    sch_cfg = SchNetConfig(**params)
-                    new_model, _ = train_schnet(ds_train, ds_val, target_dim=len(target_cols), config=sch_cfg)
+                params = {
+                    "hidden_channels": getattr(base_cfg, "hidden_channels", 128) if base_cfg else 128,
+                    "num_filters": getattr(base_cfg, "num_filters", 128) if base_cfg else 128,
+                    "num_interactions": getattr(base_cfg, "num_interactions", 6) if base_cfg else 6,
+                    "num_gaussians": getattr(base_cfg, "num_gaussians", 50) if base_cfg else 50,
+                    "cutoff": getattr(base_cfg, "cutoff", 10.0) if base_cfg else 10.0,
+                    "readout": getattr(base_cfg, "readout", "add") if base_cfg else "add",
+                    "lr": self.train_params.get("lr", 1e-3),
+                    "weight_decay": self.train_params.get("weight_decay", 0.0),
+                    "batch_size": self.train_params.get("batch_size", 16),
+                    "epochs": self.train_params.get("epochs", 30),
+                    "patience": self.train_params.get("patience", 5),
+                    "scheduler_patience": self.train_params.get(
+                        "scheduler_patience", getattr(base_cfg, "scheduler_patience", 10)
+                    ),
+                    "use_amp": bool(self.train_params.get("use_amp", getattr(base_cfg, "use_amp", False))),
+                    "grad_clip": float(self.train_params.get("grad_clip", getattr(base_cfg, "grad_clip", 0.0))),
+                    "loss": self.train_params.get("loss", getattr(base_cfg, "loss", "l1")),
+                    "target_weights": self.train_params.get("target_weights", getattr(base_cfg, "target_weights", None)),
+                    "head_dropout": float(self.train_params.get("head_dropout", getattr(base_cfg, "head_dropout", 0.0))),
+                    "interaction_dropout": float(self.train_params.get("interaction_dropout", getattr(base_cfg, "interaction_dropout", 0.0))),
+                    "num_workers": int(self.train_params.get("num_workers", getattr(base_cfg, "num_workers", 0))),
+                    "pin_memory": bool(self.train_params.get("pin_memory", getattr(base_cfg, "pin_memory", False))),
+                    "device": str(self.device),
+                    "save_dir": Path(self.train_params.get("save_dir", getattr(base_cfg, "save_dir", "models/surrogate_3d_full"))),
+                }
+                sch_cfg = RealSchNetConfig(**params)
+                new_model, _ = train_schnet_full(
+                    ds_train,
+                    ds_val,
+                    target_dim=len(target_cols),
+                    config=sch_cfg,
+                    save_path=Path(sch_cfg.save_dir) / f"schnet_full_member_{idx:02d}.pt",
+                    seed=int(self.train_params.get("seed", 1337)) + idx,
+                )
                 new_models.append(new_model.to(self.device))
             self.models = new_models
 
-    if surrogate_path.is_file():
-        # distinguish between pseudo-SchNet and full SchNet checkpoints
-        if "schnet_full" in surrogate_path.stem or surrogate_path.name == "schnet_full.pt":
-            from src.models.schnet_full import RealSchNetConfig, load_schnet_full
+    def _load_surrogate_runtime(
+        ckpt_or_dir: Path,
+        *,
+        target_columns: Sequence[str],
+    ):
+        runtime_device = surrogate_device
+        if not ckpt_or_dir.exists():
+            raise FileNotFoundError(f"Surrogate path does not exist: {ckpt_or_dir}")
+        from src.models.schnet_full import load_schnet_full
 
+        if ckpt_or_dir.is_file():
             device_spec = get_device(surrogate_device or loop_device_cfg or "cpu")
-            surrogate_device_runtime = (
+            runtime_device = (
                 f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
             )
-            sch_cfg = RealSchNetConfig(device=surrogate_device_runtime)
-            model = load_schnet_full(surrogate_path, target_dim=len(loop_cfg.target_columns), cfg=sch_cfg)
-            surrogate = SchNetSurrogateWrapper([model], surrogate_device_runtime, loop_cfg.target_columns)
-            surrogate.is_schnet_full = True  # marker
-        else:
-            from src.models.schnet_surrogate import SchNetConfig, load_schnet
+            # SchNet-only: interpret every provided checkpoint as full SchNet.
+            model = load_schnet_full(ckpt_or_dir, target_dim=len(target_columns))
+            loaded_surrogate = SchNetSurrogateWrapper([model], runtime_device, target_columns)
+            loaded_surrogate.is_schnet_full = True  # marker
+            return loaded_surrogate, runtime_device
 
-            device_spec = get_device(surrogate_device or loop_device_cfg or "cpu")
-            surrogate_device_runtime = (
-                f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
-            )
-            sch_cfg = SchNetConfig(device=surrogate_device_runtime)
-            model = load_schnet(surrogate_path, target_dim=len(loop_cfg.target_columns), cfg=sch_cfg)
-            surrogate = SchNetSurrogateWrapper([model], surrogate_device_runtime, loop_cfg.target_columns)
-    else:
-        # Directory path: check for full SchNet checkpoint inside; else fall back to ensemble
-        maybe_full = Path(args.surrogate_dir) / "schnet_full.pt"
+        # Directory path: require full SchNet artifacts.
+        maybe_full = ckpt_or_dir / "schnet_full.pt"
         if maybe_full.exists():
-            from src.models.schnet_full import RealSchNetConfig, load_schnet_full
-
             device_spec = get_device(surrogate_device or loop_device_cfg or "cpu")
-            surrogate_device_runtime = (
+            runtime_device = (
                 f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
             )
-            sch_cfg = RealSchNetConfig(device=surrogate_device_runtime)
-            model = load_schnet_full(maybe_full, target_dim=len(loop_cfg.target_columns), cfg=sch_cfg)
-            surrogate = SchNetSurrogateWrapper([model], surrogate_device_runtime, loop_cfg.target_columns)
-            surrogate.is_schnet_full = True
-        else:
-            # check for ensemble of full SchNet members
-            members = sorted(Path(args.surrogate_dir).glob("schnet_full_member_*.pt"))
-            if members:
-                from src.models.schnet_full import RealSchNetConfig, load_schnet_full
+            model = load_schnet_full(maybe_full, target_dim=len(target_columns))
+            loaded_surrogate = SchNetSurrogateWrapper([model], runtime_device, target_columns)
+            loaded_surrogate.is_schnet_full = True
+            return loaded_surrogate, runtime_device
 
-                device_spec = get_device(surrogate_device or loop_device_cfg or "cpu")
-                surrogate_device_runtime = (
-                    f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
-                )
-                sch_cfg = RealSchNetConfig(device=surrogate_device_runtime)
-                loaded = [
-                    load_schnet_full(m, target_dim=len(loop_cfg.target_columns), cfg=sch_cfg) for m in members
-                ]
-                surrogate = SchNetSurrogateWrapper(loaded, surrogate_device_runtime, loop_cfg.target_columns)
-                surrogate.is_schnet_full = True
-            else:
-                surrogate = SurrogateEnsemble.from_directory(Path(args.surrogate_dir), device=surrogate_device)
+        # check for ensemble of full SchNet members
+        members = sorted(ckpt_or_dir.glob("schnet_full_member_*.pt"))
+        if members:
+            device_spec = get_device(surrogate_device or loop_device_cfg or "cpu")
+            runtime_device = (
+                f"{device_spec.type}:{device_spec.index}" if device_spec.index is not None else device_spec.type
+            )
+            loaded = [load_schnet_full(m, target_dim=len(target_columns)) for m in members]
+            loaded_surrogate = SchNetSurrogateWrapper(loaded, runtime_device, target_columns)
+            loaded_surrogate.is_schnet_full = True
+            return loaded_surrogate, runtime_device
+
+        raise FileNotFoundError(
+            "SchNet-only mode: surrogate directory must contain 'schnet_full.pt' "
+            "or at least one 'schnet_full_member_*.pt' checkpoint. "
+            f"Got: {ckpt_or_dir}"
+        )
+
+    surrogate, surrogate_device_runtime = _load_surrogate_runtime(
+        surrogate_path,
+        target_columns=tuple(loop_cfg.target_columns),
+    )
+
+    optical_surrogate = None
+    optical_surrogate_path = getattr(args, "optical_surrogate_dir", None)
+    if optical_surrogate_path is None:
+        optical_surrogate_path = getattr(cfg.loop, "optical_surrogate_dir", None)
+    if optical_surrogate_path:
+        if not tuple(loop_cfg.optical_target_columns):
+            raise ValueError(
+                "loop.optical_target_columns must be non-empty when an optical surrogate is configured."
+            )
+        optical_surrogate, _ = _load_surrogate_runtime(
+            Path(optical_surrogate_path),
+            target_columns=tuple(loop_cfg.optical_target_columns),
+        )
+        logging.getLogger(__name__).info(
+            "Loaded optical surrogate from %s with targets=%s",
+            optical_surrogate_path,
+            tuple(loop_cfg.optical_target_columns),
+        )
+    elif abs(float(getattr(loop_cfg, "optical_score_weight", 0.0) or 0.0)) > 1e-12:
+        logging.getLogger(__name__).warning(
+            "optical_score_weight=%.3f but no optical surrogate provided; optical score will be ignored.",
+            float(getattr(loop_cfg, "optical_score_weight", 0.0) or 0.0),
+        )
+
+    oscillator_surrogate = None
+    oscillator_surrogate_path = getattr(args, "oscillator_surrogate_dir", None)
+    if oscillator_surrogate_path is None:
+        oscillator_surrogate_path = getattr(cfg.loop, "oscillator_surrogate_dir", None)
+    if oscillator_surrogate_path:
+        if not tuple(loop_cfg.oscillator_target_columns):
+            raise ValueError(
+                "loop.oscillator_target_columns must be non-empty when an oscillator surrogate is configured."
+            )
+        oscillator_surrogate, _ = _load_surrogate_runtime(
+            Path(oscillator_surrogate_path),
+            target_columns=tuple(loop_cfg.oscillator_target_columns),
+        )
+        logging.getLogger(__name__).info(
+            "Loaded oscillator surrogate from %s with targets=%s",
+            oscillator_surrogate_path,
+            tuple(loop_cfg.oscillator_target_columns),
+        )
+    elif abs(float(getattr(loop_cfg, "oscillator_score_weight", 0.0) or 0.0)) > 1e-12:
+        logging.getLogger(__name__).warning(
+            "oscillator_score_weight=%.3f but no oscillator surrogate provided; oscillator score will be ignored.",
+            float(getattr(loop_cfg, "oscillator_score_weight", 0.0) or 0.0),
+        )
 
     generator = None
     generator3d = None
@@ -983,12 +1570,12 @@ def run_active_loop(args: argparse.Namespace) -> None:
 
     loop = ActiveLearningLoop(
         surrogate=surrogate,
+        optical_surrogate=optical_surrogate,
+        oscillator_surrogate=oscillator_surrogate,
         labelled=labelled,
         pool=pool,
         config=loop_cfg,
         generator=generator,
-        generator3d=generator3d,
-        generator3d_template=generator3d_template,
         fragment_vocab=fragment_vocab,
         dft=dft,
         generator_device=generator_device_runtime,
@@ -1012,7 +1599,11 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     train_parser = subparsers.add_parser("train-surrogate")
-    train_parser.add_argument("--config", default="configs/train_conf.yaml")
+    train_parser.add_argument(
+        "--config",
+        default="configs/train_conf_3d_full.yaml",
+        help="SchNet-only alias command; defaults to full SchNet config.",
+    )
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument(
         "--device",
@@ -1044,7 +1635,11 @@ def main() -> None:
     )
 
     train3d_parser = subparsers.add_parser("train-surrogate-3d")
-    train3d_parser.add_argument("--config", default="configs/train_conf_3d.yaml")
+    train3d_parser.add_argument(
+        "--config",
+        default="configs/train_conf_3d_full.yaml",
+        help="SchNet-only alias command; defaults to full SchNet config.",
+    )
     train3d_parser.add_argument(
         "--device",
         default=None,
@@ -1106,7 +1701,152 @@ def main() -> None:
 
     al_parser = subparsers.add_parser("active-loop")
     al_parser.add_argument("--config", default="configs/active_learn.yaml")
-    al_parser.add_argument("--surrogate-dir", default="models/surrogate")
+    al_parser.add_argument(
+        "--objective-mode",
+        default=None,
+        choices=["red", "blue", "general"],
+        help="Optional objective preset mode (overrides loop.objective_mode in config).",
+    )
+    al_parser.add_argument(
+        "--objective-profile",
+        default=None,
+        help="Path to objective profile YAML (default from config or configs/objectives.yaml).",
+    )
+    al_parser.add_argument(
+        "--rl-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable RL update path (overrides loop.rl.enabled).",
+    )
+    al_parser.add_argument(
+        "--rl-every-n-iterations",
+        type=int,
+        default=None,
+        help="Run RL update every N active-loop iterations.",
+    )
+    al_parser.add_argument(
+        "--rl-steps-per-update",
+        type=int,
+        default=None,
+        help="Number of RL gradient steps per update.",
+    )
+    al_parser.add_argument(
+        "--rl-batch-size",
+        type=int,
+        default=None,
+        help="RL sampling batch size.",
+    )
+    al_parser.add_argument(
+        "--rl-lr",
+        type=float,
+        default=None,
+        help="RL optimizer learning rate.",
+    )
+    al_parser.add_argument(
+        "--rl-algorithm",
+        default=None,
+        choices=["reinforce", "policy_gradient", "ppo"],
+        help="RL algorithm for generator updates.",
+    )
+    al_parser.add_argument(
+        "--rl-entropy-weight",
+        type=float,
+        default=None,
+        help="Entropy regularization weight for RL policy loss.",
+    )
+    al_parser.add_argument(
+        "--rl-baseline-momentum",
+        type=float,
+        default=None,
+        help="EMA momentum for reward baseline (0..1).",
+    )
+    al_parser.add_argument(
+        "--rl-reward-clip",
+        type=float,
+        default=None,
+        help="Absolute reward clip value used in RL loss.",
+    )
+    al_parser.add_argument(
+        "--rl-normalize-advantage",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable advantage normalization.",
+    )
+    al_parser.add_argument(
+        "--rl-use-qc-top-k",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable/disable QC override for top-K RL candidates.",
+    )
+    al_parser.add_argument(
+        "--rl-qc-top-k",
+        type=int,
+        default=None,
+        help="Top-K candidates for QC reward override in RL mode.",
+    )
+    al_parser.add_argument(
+        "--rl-warmup-iterations",
+        type=int,
+        default=None,
+        help="Skip RL updates for the first N completed loop iterations.",
+    )
+    al_parser.add_argument(
+        "--rl-max-grad-norm",
+        type=float,
+        default=None,
+        help="Gradient clipping max-norm for RL updates.",
+    )
+    al_parser.add_argument(
+        "--rl-checkpoint-every",
+        type=int,
+        default=None,
+        help="Write RL latest checkpoint every N RL updates.",
+    )
+    al_parser.add_argument(
+        "--rl-value-loss-weight",
+        type=float,
+        default=None,
+        help="Value-function loss weight for policy-gradient/PPO updates.",
+    )
+    al_parser.add_argument(
+        "--rl-ppo-clip-ratio",
+        type=float,
+        default=None,
+        help="PPO clipping epsilon.",
+    )
+    al_parser.add_argument(
+        "--rl-ppo-epochs",
+        type=int,
+        default=None,
+        help="Number of PPO epochs per RL update.",
+    )
+    al_parser.add_argument(
+        "--rl-ppo-minibatch-size",
+        type=int,
+        default=None,
+        help="Mini-batch size for PPO updates.",
+    )
+    al_parser.add_argument(
+        "--rl-ppo-target-kl",
+        type=float,
+        default=None,
+        help="Optional PPO early-stop KL target (set 0 or negative to disable).",
+    )
+    al_parser.add_argument(
+        "--surrogate-dir",
+        default="models/surrogate_3d_full",
+        help="Path to full SchNet surrogate checkpoint or directory containing schnet_full*.pt artifacts.",
+    )
+    al_parser.add_argument(
+        "--optical-surrogate-dir",
+        default=None,
+        help="Optional second surrogate path for optical targets (e.g. lambda_max_nm, oscillator_strength).",
+    )
+    al_parser.add_argument(
+        "--oscillator-surrogate-dir",
+        default=None,
+        help="Optional third surrogate path for oscillator-focused targets (e.g. oscillator_strength).",
+    )
     al_parser.add_argument("--generator-ckpt", default=None)
     al_parser.add_argument("--generator-3d-ckpt", default=None)
     al_parser.add_argument("--iterations", type=int, default=5)

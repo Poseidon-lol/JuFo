@@ -2,7 +2,7 @@ dataset:
   path: data/showcase/jtvae_showcase_6000.csv
   mol_column: mol
   smiles_column: smiles
-  target_columns: [homo, lumo, gap]
+  target_columns: [homo, lumo, gap, optical_lumo, spectral_overlap]
   val_fraction: 0.1
 
 model:
