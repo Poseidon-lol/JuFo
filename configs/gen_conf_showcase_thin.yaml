@@ -1,0 +1,45 @@
+dataset:
+  path: data/processed/jtvae_showcase_thin.csv
+  target_columns: [homo, lumo, gap]
+  max_fragments: 14
+  fragment_min_count: 1
+  max_heavy_atoms: 70
+  fragment_method: brics
+  min_fragment_heavy_atoms: 1
+model:
+  z_dim: 64
+  hidden_dim: 192
+  encoder_layers: 4
+  cond_dim: 3
+training:
+  epochs: 35
+  batch_size: 32
+  lr: 0.0004
+  kl_weight: 0.25
+  property_loss_weight: 0.06
+  adjacency_loss_weight: 0.8
+  scheduler_patience: 8
+  scheduler_factor: 0.6
+  device: auto
+  use_amp: true
+  compile: false
+  compile_mode: default
+  compile_fullgraph: false
+  max_grad_norm: 0.7
+  live_decode:
+    enabled: true
+    path: experiments/showcase_thin/live_decode_dashboard.html
+    refresh_ms: 1000
+    step_delay: 0.06
+    topk: 3
+    max_steps: 8
+    temperature: 1.0
+    every_n_epochs: 1
+    adjacency_threshold: 0.5
+    exhibition_mode: false
+    local_view_enabled: true
+    local_view_host: 127.0.0.1
+    local_view_port: 8766
+    open_browser: true
+save_dir: models/generator_showcase_thin
+

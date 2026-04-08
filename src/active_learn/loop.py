@@ -3259,12 +3259,18 @@ class ActiveLearningLoop:
             "best_red": best_red,
             "rl_reward_mean": None,
             "rl_total_loss": None,
+            "rl_policy_loss": None,
+            "rl_value_loss": None,
+            "rl_entropy": None,
             "rl_validity": None,
             "rl_uniqueness": None,
             "rl_approx_kl": None,
             "rl_clipfrac": None,
             "rl_explained_variance": None,
             "rl_entropy_weight": None,
+            "rl_actor_lr": None,
+            "rl_critic_lr": None,
+            "rl_ppo_clip_ratio_used": None,
         }
         self._live_history_rows.append(history_row)
 
@@ -3278,12 +3284,18 @@ class ActiveLearningLoop:
         if rl_metrics:
             history_row["rl_reward_mean"] = float(rl_metrics.get("reward_mean", np.nan))
             history_row["rl_total_loss"] = float(rl_metrics.get("total_loss", np.nan))
+            history_row["rl_policy_loss"] = float(rl_metrics.get("policy_loss", np.nan))
+            history_row["rl_value_loss"] = float(rl_metrics.get("value_loss", np.nan))
+            history_row["rl_entropy"] = float(rl_metrics.get("entropy", np.nan))
             history_row["rl_validity"] = float(rl_metrics.get("validity", np.nan))
             history_row["rl_uniqueness"] = float(rl_metrics.get("uniqueness", np.nan))
             history_row["rl_approx_kl"] = float(rl_metrics.get("approx_kl", np.nan))
             history_row["rl_clipfrac"] = float(rl_metrics.get("clipfrac", np.nan))
             history_row["rl_explained_variance"] = float(rl_metrics.get("explained_variance", np.nan))
             history_row["rl_entropy_weight"] = float(rl_metrics.get("entropy_weight_used", np.nan))
+            history_row["rl_actor_lr"] = float(rl_metrics.get("actor_lr", np.nan))
+            history_row["rl_critic_lr"] = float(rl_metrics.get("critic_lr", np.nan))
+            history_row["rl_ppo_clip_ratio_used"] = float(rl_metrics.get("ppo_clip_ratio_used", np.nan))
             history_row["rl_qc_override_count"] = float(rl_metrics.get("qc_override_count", 0.0))
             history_row["rl_updates"] = float(rl_metrics.get("rl_updates", self._rl_updates))
 

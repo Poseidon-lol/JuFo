@@ -1,0 +1,137 @@
+loop:
+  objective_mode: red
+  objective_profile_path: configs/objectives.yaml
+  device: auto
+  surrogate_device: auto
+  generator_device: auto
+  batch_size: 10
+  target_columns: [homo, lumo, gap]
+  maximise: [false, true, false]
+  generator_samples: 96
+  generator_attempts: 5
+  results_dir: experiments/showcase_ppo/ppo
+  diversity_threshold: 0.0
+  property_aliases:
+    HOMO: homo
+    LUMO: lumo
+    gap: gap
+  max_pool_eval: 192
+  predict_batch_size: 192
+  predict_mc_samples: 1
+  red_score_columns: [homo, lumo, gap]
+  red_score_targets: [-5.3, -3.1, 1.8]
+  red_score_tolerances: [0.4, 0.4, 0.6]
+  red_score_weights: [1.0, 1.0, 1.0]
+  red_score_missing_penalty: 2.0
+  red_score_pass_threshold: -2.0
+  red_score_require_qc_success: false
+  early_stop_no_improve_iterations: 0
+  early_stop_min_delta: 0.0
+  export_top_k: 30
+  export_sort_column: red_score
+  export_require_qc_success: false
+  export_require_red_pass: false
+  export_top_candidates_path: experiments/showcase_ppo/ppo/top_candidates.csv
+  predict_num_workers: 0
+  predict_pin_memory: false
+  predict_amp: true
+  live_dashboard:
+    enabled: true
+    path: experiments/showcase_ppo/ppo/active_loop_live_dashboard.html
+    refresh_ms: 1000
+    selected_top_k: 8
+    local_view_enabled: true
+    local_view_host: 127.0.0.1
+    local_view_port: 8777
+    open_browser: true
+  save_diagnostics: false
+  diagnostics_every: 0
+  auto_relax_filters: true
+  require_conjugation: false
+  min_conjugated_bonds: 0
+  min_alternating_conjugated_bonds: 0
+  min_pi_conjugated_fraction: null
+  min_aromatic_rings: 0
+  require_neutral: false
+  max_charged_atoms: null
+  max_rotatable_bonds: null
+  max_rotatable_bonds_conjugated: null
+  max_branch_points: null
+  max_branch_degree: null
+  property_filters: {}
+  qc_extra_properties: []
+  generator_refresh:
+    epochs: 1
+    batch_size: 16
+    lr: 0.0001
+    kl_weight: 0.4
+    property_weight: 0.05
+    adj_weight: 0.8
+    save_dir: experiments/showcase_ppo/ppo/generator_refresh
+  rl:
+    enabled: true
+    every_n_iterations: 1
+    steps_per_update: 1
+    batch_size: 32
+    lr: 0.00001
+    actor_lr: 0.000015
+    critic_lr: 0.00003
+    algorithm: ppo
+    entropy_weight: 0.01
+    entropy_weight_start: 0.02
+    entropy_weight_end: 0.005
+    entropy_decay_updates: 120
+    baseline_momentum: 0.9
+    reward_clip: 5.0
+    reward_running_norm: true
+    reward_norm_eps: 1.0e-6
+    reward_norm_clip: 5.0
+    warmup_iterations: 0
+    max_grad_norm: 1.0
+    checkpoint_every: 10
+    value_loss_weight: 0.5
+    anchor_weight: 0.02
+    ppo_clip_ratio: 0.2
+    ppo_clip_ratio_min: 0.05
+    ppo_clip_ratio_max: 0.35
+    ppo_epochs: 2
+    ppo_minibatch_size: 32
+    ppo_target_kl: 0.03
+    ppo_value_clip_range: 0.2
+    ppo_adaptive_kl: true
+    ppo_adaptive_kl_high_mult: 1.5
+    ppo_adaptive_kl_low_mult: 0.5
+    ppo_lr_down_factor: 0.6
+    ppo_lr_up_factor: 1.03
+    ppo_clip_down_factor: 0.9
+    ppo_clip_up_factor: 1.02
+    ppo_actor_lr_min: 0.000001
+    ppo_actor_lr_max: 0.0002
+    normalize_advantage: true
+    use_qc_top_k: false
+    qc_top_k: 0
+
+assemble:
+  beam_width: 3
+  topk_per_node: 3
+  adjacency_threshold: 0.45
+  max_tree_nodes: 8
+  score_partial_assembly: false
+
+acquisition:
+  kind: target
+  beta: 0.0
+  targets: [-5.3, -3.1, 1.8]
+  tolerances: [0.4, 0.4, 0.6]
+  weights: [1.0, 1.0, 1.0]
+  maximise: [false, true, false]
+
+scheduler:
+  max_iterations: 50
+  surrogate_retrain_every: 0
+  generator_refresh_every: 0
+
+data:
+  labelled: data/processed/opv_seed_showcase_300.csv
+  pool: data/processed/empty_pool.csv
+  fragment_vocab: models/generator/fragment_vocab.json

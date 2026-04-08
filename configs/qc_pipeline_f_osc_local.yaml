@@ -1,0 +1,51 @@
+﻿geometry:
+  force_field: MMFF94
+  max_iterations: 300
+  embed_tries: 20
+  random_seed: 1337
+  optimize: true
+  use_etkdg: true
+  conformers: 10
+  refine_forcefield: MMFF94
+  final_opt_forcefield: MMFF94
+  final_opt_iterations: 200
+  rms_force_thresh: 0.5
+  pick_lowest_energy: true
+
+quantum:
+  engine: orca
+  executable: D:/Ackern/Orca/orca.exe
+  method: B3LYP
+  basis: def2-SVP
+  level_of_theory: B3LYP/def2-SVP
+  dispersion: D3BJ
+  solvent_model: CPCM
+  solvent: chloroform
+  properties: [lambda_max, oscillator_strength]
+  charge: 0
+  multiplicity: 1
+  keywords:
+    nprocs: 1
+    maxcore: 1200
+    tddft_nroots: 12
+  environment:
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
+
+fallbacks:
+  - engine: orca
+    method: PBE0
+    basis: def2-SVP
+    dispersion: D3BJ
+  - engine: xtb
+    method: GFN2-xTB
+    basis: null
+    dispersion: null
+
+max_workers: 1
+poll_interval: 20.0
+work_dir: C:/Users/Luka/Desktop/JuFo-main/.qc_runs_f_osc_one
+cleanup_workdir: true
+store_metadata: true
+allow_fallback: false
+walltime_limit: 1800

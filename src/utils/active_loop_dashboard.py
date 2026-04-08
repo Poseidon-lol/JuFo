@@ -155,6 +155,122 @@ def _acq_chart_svg(history: List[Dict[str, object]], *, width: int = 760, height
     )
 
 
+def _metric_chart_svg(
+    history: List[Dict[str, object]],
+    *,
+    series: List[Dict[str, str]],
+    width: int = 760,
+    height: int = 220,
+    empty_text: str = "Noch keine Werte.",
+) -> str:
+    if not history:
+        return f"<div class='muted'>{html.escape(empty_text)}</div>"
+
+    points_by_series: List[List[tuple[float, float]]] = []
+    all_y: List[float] = []
+    all_x: List[float] = []
+    for spec in series:
+        key = spec.get("key", "")
+        pts: List[tuple[float, float]] = []
+        for idx, row in enumerate(history):
+            y = _safe_float(row.get(key))
+            if y is None:
+                continue
+            x = _safe_float(row.get("iteration"))
+            if x is None:
+                x = float(idx + 1)
+            pts.append((float(x), float(y)))
+            all_x.append(float(x))
+            all_y.append(float(y))
+        points_by_series.append(pts)
+
+    if not all_y or not all_x:
+        return f"<div class='muted'>{html.escape(empty_text)}</div>"
+
+    x_min = min(all_x)
+    x_max = max(all_x)
+    if abs(x_max - x_min) < 1e-9:
+        x_max = x_min + 1.0
+    y_min = min(all_y)
+    y_max = max(all_y)
+    if abs(y_max - y_min) < 1e-9:
+        y_max = y_min + 1.0
+
+    pad_x = 46.0
+    pad_y = 24.0
+    inner_w = max(20.0, float(width) - 2.0 * pad_x)
+    inner_h = max(20.0, float(height) - 2.0 * pad_y)
+
+    def _xy_to_svg(x: float, y: float) -> tuple[float, float]:
+        sx = pad_x + ((x - x_min) / (x_max - x_min)) * inner_w
+        sy = pad_y + (1.0 - ((y - y_min) / (y_max - y_min))) * inner_h
+        return sx, sy
+
+    line_parts: List[str] = []
+    legend_parts: List[str] = []
+    for spec, pts in zip(series, points_by_series):
+        if not pts:
+            continue
+        color = spec.get("color", "#0f766e")
+        label = html.escape(spec.get("label", spec.get("key", "metric")))
+        pts_svg = " ".join(
+            f"{_xy_to_svg(x, y)[0]:.1f},{_xy_to_svg(x, y)[1]:.1f}" for x, y in pts
+        )
+        line_parts.append(
+            f"<polyline fill='none' stroke='{color}' stroke-width='2.2' points='{pts_svg}'/>"
+        )
+        for x, y in pts:
+            sx, sy = _xy_to_svg(x, y)
+            line_parts.append(f"<circle cx='{sx:.1f}' cy='{sy:.1f}' r='2.1' fill='{color}'/>")
+        legend_parts.append(
+            f"<span style='display:inline-flex;align-items:center;gap:6px;margin-right:12px;'>"
+            f"<span style='display:inline-block;width:10px;height:10px;border-radius:50%;background:{color};'></span>"
+            f"{label}</span>"
+        )
+
+    legend_html = "".join(legend_parts) if legend_parts else "<span class='muted'>Keine Reihen.</span>"
+    return (
+        f"<svg viewBox='0 0 {width} {height}' xmlns='http://www.w3.org/2000/svg' class='acq-chart'>"
+        f"<rect x='1' y='1' width='{width - 2}' height='{height - 2}' fill='#f8fafc' stroke='#d1d5db' rx='8'/>"
+        f"<line x1='{pad_x}' y1='{pad_y}' x2='{pad_x}' y2='{height - pad_y}' stroke='#94a3b8' stroke-width='1'/>"
+        f"<line x1='{pad_x}' y1='{height - pad_y}' x2='{width - pad_x}' y2='{height - pad_y}' stroke='#94a3b8' stroke-width='1'/>"
+        f"<line x1='{pad_x}' y1='{pad_y + inner_h / 2.0:.1f}' x2='{width - pad_x}' y2='{pad_y + inner_h / 2.0:.1f}' stroke='#e2e8f0' stroke-width='1'/>"
+        f"{''.join(line_parts)}"
+        f"<text x='{pad_x}' y='14' font-size='11' fill='#334155' font-family='Consolas, \"Courier New\", monospace'>y max {y_max:.4f}</text>"
+        f"<text x='{pad_x}' y='{height - 7}' font-size='11' fill='#334155' font-family='Consolas, \"Courier New\", monospace'>y min {y_min:.4f}</text>"
+        f"</svg><div class='muted' style='margin-top:6px;'>{legend_html}</div>"
+    )
+
+
+def _rl_reward_chart_svg(history: List[Dict[str, object]], *, width: int = 760, height: int = 220) -> str:
+    return _metric_chart_svg(
+        history,
+        series=[
+            {"key": "rl_reward_mean", "label": "reward_mean", "color": "#0891b2"},
+            {"key": "rl_total_loss", "label": "total_loss", "color": "#f97316"},
+            {"key": "rl_validity", "label": "validity", "color": "#10b981"},
+        ],
+        width=width,
+        height=height,
+        empty_text="Noch keine RL reward/loss Werte.",
+    )
+
+
+def _ppo_health_chart_svg(history: List[Dict[str, object]], *, width: int = 760, height: int = 220) -> str:
+    return _metric_chart_svg(
+        history,
+        series=[
+            {"key": "rl_approx_kl", "label": "approx_kl", "color": "#2563eb"},
+            {"key": "rl_clipfrac", "label": "clipfrac", "color": "#7c3aed"},
+            {"key": "rl_explained_variance", "label": "explained_variance", "color": "#16a34a"},
+            {"key": "rl_entropy_weight", "label": "entropy_weight", "color": "#b45309"},
+        ],
+        width=width,
+        height=height,
+        empty_text="Noch keine PPO health Werte.",
+    )
+
+
 def write_active_loop_dashboard(
     html_path: Path,
     *,
@@ -185,6 +301,8 @@ def write_active_loop_dashboard(
     last_rl_kl = _fmt_float(history_rows[-1].get("rl_approx_kl") if history_rows else None)
     last_rl_clipfrac = _fmt_float(history_rows[-1].get("rl_clipfrac") if history_rows else None)
     last_rl_ev = _fmt_float(history_rows[-1].get("rl_explained_variance") if history_rows else None)
+    last_rl_actor_lr = _fmt_float(history_rows[-1].get("rl_actor_lr") if history_rows else None)
+    last_rl_clip_ratio = _fmt_float(history_rows[-1].get("rl_ppo_clip_ratio_used") if history_rows else None)
 
     cards: List[str] = []
     for row in selected_rows:
@@ -247,6 +365,8 @@ def write_active_loop_dashboard(
         cli_html.append(f"<div class='cli-line'>{html.escape(text)}</div>")
 
     acq_chart = _acq_chart_svg(history_rows)
+    rl_reward_chart = _rl_reward_chart_svg(history_rows, width=700, height=210)
+    ppo_health_chart = _ppo_health_chart_svg(history_rows, width=700, height=210)
     page = f"""<!doctype html>
 <html lang="de">
 <head>
@@ -280,7 +400,7 @@ def write_active_loop_dashboard(
     }}
     .kpis {{
       display: grid;
-      grid-template-columns: repeat(11, minmax(0, 1fr));
+      grid-template-columns: repeat(13, minmax(0, 1fr));
       gap: 8px;
       margin-bottom: 10px;
     }}
@@ -294,6 +414,18 @@ def write_active_loop_dashboard(
     .kpi .val {{ font-family: Consolas, 'Courier New', monospace; margin-top: 2px; font-size: 1rem; }}
     progress {{ width: 100%; height: 16px; }}
     .acq-chart {{ width: 100%; height: auto; display: block; }}
+    .chart-grid {{
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 10px;
+    }}
+    .chart-panel {{
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 8px;
+      background: #ffffff;
+    }}
     .mol-grid {{
       margin-top: 8px;
       display: grid;
@@ -405,6 +537,8 @@ def write_active_loop_dashboard(
           <div class="kpi"><div class="key">RL KL (last)</div><div class="val">{last_rl_kl}</div></div>
           <div class="kpi"><div class="key">RL ClipFrac</div><div class="val">{last_rl_clipfrac}</div></div>
           <div class="kpi"><div class="key">RL ExpVar</div><div class="val">{last_rl_ev}</div></div>
+          <div class="kpi"><div class="key">PPO Actor LR</div><div class="val">{last_rl_actor_lr}</div></div>
+          <div class="kpi"><div class="key">PPO Clip Ratio</div><div class="val">{last_rl_clip_ratio}</div></div>
         </div>
         <div class="box">
           <div class="muted">Fortschritt {progress * 100.0:.1f}%</div>
@@ -414,6 +548,17 @@ def write_active_loop_dashboard(
           <h2>Acquisition Verlauf</h2>
           {acq_chart}
           <div class="muted" style="margin-top:6px;">teal = best_acq, orange = mean_acq</div>
+        </div>
+        <div class="box" style="margin-top:12px;">
+          <h2>PPO Live Verlauf</h2>
+          <div class="chart-grid">
+            <div class="chart-panel">
+              {rl_reward_chart}
+            </div>
+            <div class="chart-panel">
+              {ppo_health_chart}
+            </div>
+          </div>
         </div>
         <div class="box" style="margin-top:12px;">
           <h2>Ausgewaehlte Molekuele (letzte Iteration)</h2>

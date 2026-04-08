@@ -1,0 +1,31 @@
+dataset:
+  path: data/processed/opv_seed_showcase_300.csv
+  smiles_column: smiles
+  target_columns: [homo, lumo, gap]
+  val_fraction: 0.15
+
+model:
+  hidden_channels: 96
+  num_filters: 96
+  num_interactions: 4
+  num_gaussians: 40
+  cutoff: 8.0
+  readout: add
+  head_dropout: 0.0
+  interaction_dropout: 0.0
+
+training:
+  epochs: 12
+  batch_size: 24
+  lr: 0.0008
+  weight_decay: 0.0
+  patience: 5
+  scheduler_patience: 3
+  device: auto
+  use_amp: false
+  num_workers: 0
+  pin_memory: false
+  grad_clip: 1.0
+  loss: smooth_l1
+  seed: 1337
+  save_dir: models/surrogate_3d_showcase_bootstrap
