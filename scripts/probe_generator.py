@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models.jtvae_extended import JTVAE, sample_conditional
+from src.models.jtvae_extended import JTVAE, normalize_jtvae_state_dict, sample_conditional
 
 
 def _infer_cond_dim(state: dict) -> int:
@@ -68,7 +68,7 @@ def main() -> None:
 
     ckpt_path = Path(args.ckpt)
     vocab_path = Path(args.vocab)
-    state = torch.load(ckpt_path, map_location="cpu")
+    state = normalize_jtvae_state_dict(torch.load(ckpt_path, map_location="cpu"))
     frag_vocab = _load_vocab(vocab_path)
 
     hidden_dim = state["encoder.tree_encoder.input_proj.weight"].shape[0]
@@ -88,7 +88,11 @@ def main() -> None:
         cond_dim=cond_dim,
         max_tree_nodes=max_tree_nodes,
     )
-    model.load_state_dict(state)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"warning: initialized {len(missing)} missing tensors from current model defaults")
+    if unexpected:
+        print(f"warning: ignored {len(unexpected)} unexpected checkpoint tensors")
     model.eval()
 
     samples = sample_conditional(

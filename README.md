@@ -2,6 +2,10 @@
 
 Wir entwickeln eine KI-gest??tzte Entdeckungspipeline f??r organische Halbleiter: Ein JT-VAE-Generator erzeugt p- und n-dotierbare OSC-Kandidaten, ein Surrogat (MPNN, optional SchNet-3D) bewertet ihre elektronischen Eigenschaften, und eine Active-Learning-Schleife priorisiert Molek??le f??r Hochfidelit??ts-QC, Synthese und experimentelle Tests. Ziel ist es, verwertbare Materialien f??r organische Solarzellen zu identifizieren und in die Laborsynthese zu bringen.
 
+## JT-VAE Showcase
+
+For a fresh demo machine, start with [docs/jtvae_showcase_thin.md](docs/jtvae_showcase_thin.md). It includes clone/setup commands, a CUDA smoke test with the included small JT-VAE checkpoint, and one-command live-dashboard training scripts.
+
 # OSC Discovery Plan
 
 ## Phase 1 - Data Foundation

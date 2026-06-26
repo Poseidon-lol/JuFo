@@ -655,7 +655,8 @@ class ActiveLearningLoop:
         self._init_live_dashboard()
 
     def _build_requested_qc_properties(self) -> List[str]:
-        inverse_alias = {v: k for k, v in self.property_aliases.items()}
+        property_aliases = getattr(self, "property_aliases", {}) or {}
+        inverse_alias = {v: k for k, v in property_aliases.items()}
         requested: List[str] = []
         seen: set[str] = set()
         for column in self.config.target_columns:
@@ -996,11 +997,12 @@ class ActiveLearningLoop:
             return
         if not self._red_score_columns or self._red_score_targets is None:
             return
-        inverse_alias = {v: k for k, v in self.property_aliases.items()}
+        property_aliases = getattr(self, "property_aliases", {}) or {}
+        inverse_alias = {v: k for k, v in property_aliases.items()}
 
         def _resolve_value(row_index: int, desired_col: str):
             candidates: List[str] = [desired_col]
-            mapped = self.property_aliases.get(desired_col)
+            mapped = property_aliases.get(desired_col)
             if mapped:
                 candidates.append(str(mapped))
             inverse = inverse_alias.get(desired_col)

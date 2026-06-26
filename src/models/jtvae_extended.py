@@ -10,7 +10,7 @@ import io
 import base64
 import html
 import urllib.parse
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -65,6 +65,47 @@ except Exception:
 
 from src.utils.device import ensure_state_dict_on_cpu, get_device, move_to_device
 from src.utils.dashboard_server import start_dashboard_server
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        try:
+            return next(module.buffers()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+
+def normalize_jtvae_state_dict(checkpoint: Any) -> Dict[str, torch.Tensor]:
+    """Extract a plain JTVAE state_dict from common checkpoint wrappers."""
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError("JT-VAE checkpoint must be a state_dict-like mapping.")
+
+    state: Any = checkpoint
+    for key in ("state_dict", "model_state_dict", "generator_state_dict", "model"):
+        candidate = checkpoint.get(key)
+        if isinstance(candidate, dict):
+            state = candidate
+            break
+    if not isinstance(state, dict):
+        raise TypeError("JT-VAE checkpoint did not contain a valid state_dict.")
+
+    normalized = {}
+    for key, value in state.items():
+        if not isinstance(key, str):
+            continue
+        clean = key.replace("._orig_mod.", ".")
+        changed = True
+        while changed:
+            changed = False
+            for prefix in ("_orig_mod.", "module.", "model.", "generator."):
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix):]
+                    changed = True
+        normalized[clean] = value
+    return normalized
 
 # Fragmentation utilities (very simplified)
 
@@ -755,7 +796,7 @@ class JTVAE(nn.Module):
         if assemble_kwargs is None:
             assemble_kwargs = {}
         samples = []
-        adj_probs = torch.sigmoid(adj_logits).detach().cpu().numpy()
+        adj_probs = np.asarray(torch.sigmoid(adj_logits).detach().cpu().tolist(), dtype=np.float32)
         for b in range(n_samples):
             if fragment_idx_to_smiles is None:
                 samples.append(
@@ -860,21 +901,32 @@ class JTVAE(nn.Module):
         device=None,
         temperature: float = 1.0,
     ) -> Tuple[torch.device, torch.Tensor, Optional[torch.Tensor]]:
-        device_spec = get_device(device)
+        device_spec = get_device(device if device is not None else _module_device(self))
         target = device_spec.target
+        if _module_device(self) != target:
+            self.to(target)
         z = torch.randn(int(n_samples), self.z_dim, device=target) * float(temperature)
         cond_t = None
         if cond is not None:
             if torch.is_tensor(cond):
-                cond_t = cond
+                cond_t = cond.detach().float()
             else:
                 cond_np = cond if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
-                cond_t = torch.from_numpy(np.atleast_1d(cond_np)).float()
+                cond_t = torch.tensor(np.atleast_1d(cond_np).tolist(), dtype=torch.float32)
             if cond_t.dim() == 0:
                 cond_t = cond_t.view(1, 1)
             elif cond_t.dim() == 1:
                 cond_t = cond_t.unsqueeze(0)
-            cond_t = cond_t.repeat(int(n_samples), 1)
+            elif cond_t.dim() > 2:
+                cond_t = cond_t.reshape(cond_t.size(0), -1)
+            if self.cond_dim and cond_t.size(-1) != self.cond_dim:
+                raise ValueError(f"Provided cond dim {cond_t.size(-1)} != model cond_dim {self.cond_dim}")
+            if cond_t.size(0) == 1 and int(n_samples) != 1:
+                cond_t = cond_t.expand(int(n_samples), -1)
+            elif cond_t.size(0) != int(n_samples):
+                raise ValueError(
+                    f"Condition batch size {cond_t.size(0)} must be 1 or match n_samples={int(n_samples)}."
+                )
             cond_t = cond_t.to(target)
         elif self.cond_dim and self.cond_dim > 0:
             # If conditioned model but no cond provided, sample with zero conditioning.
@@ -943,8 +995,8 @@ class JTVAE(nn.Module):
             },
         )
         adj_threshold = float(assemble_kwargs.get("adjacency_threshold", 0.5))
-        tri_i = tri[0].detach().cpu().numpy() if tri.numel() > 0 else np.asarray([], dtype=np.int64)
-        tri_j = tri[1].detach().cpu().numpy() if tri.numel() > 0 else np.asarray([], dtype=np.int64)
+        tri_i = np.asarray(tri[0].detach().cpu().tolist(), dtype=np.int64) if tri.numel() > 0 else np.asarray([], dtype=np.int64)
+        tri_j = np.asarray(tri[1].detach().cpu().tolist(), dtype=np.int64) if tri.numel() > 0 else np.asarray([], dtype=np.int64)
 
         samples: List[Dict[str, object]] = []
         for b in range(int(n_samples)):
@@ -966,7 +1018,7 @@ class JTVAE(nn.Module):
             frag_smiles = [str(fragment_idx_to_smiles.get(int(idx), "")) for idx in frag_idxs]
             adjacency = np.zeros((max_nodes, max_nodes), dtype=np.float32)
             if tri.numel() > 0:
-                vals = adj_actions[b].detach().cpu().numpy().astype(np.float32)
+                vals = np.asarray(adj_actions[b].detach().cpu().tolist(), dtype=np.float32)
                 adjacency[tri_i, tri_j] = vals
                 adjacency[tri_j, tri_i] = vals
             assembled_smiles, status = assemble_fragments(
@@ -1704,7 +1756,7 @@ def _build_live_decode_steps(
         cond_t = torch.zeros(1, int(model.cond_dim), device=device)
     frags_logits, _, adj_logits = model.decoder(z, max_tree_nodes=decode_steps, cond=cond_t)
     logits = frags_logits[0]
-    adjacency = torch.sigmoid(adj_logits[0]).detach().cpu().numpy()
+    adjacency = np.asarray(torch.sigmoid(adj_logits[0]).detach().cpu().tolist(), dtype=np.float32)
 
     picked_fragments: List[str] = []
     steps: List[Dict[str, object]] = []
@@ -2342,6 +2394,19 @@ def _write_live_decode_dashboard(
                     tmp_path.unlink()
 
 
+class _TorchRandomSampler(torch.utils.data.Sampler[int]):
+    """Random sampler that avoids PyTorch's NumPy-backed RandomSampler path."""
+
+    def __init__(self, data_source):
+        self.data_source = data_source
+
+    def __iter__(self):
+        return iter(torch.randperm(len(self.data_source)).tolist())
+
+    def __len__(self):
+        return len(self.data_source)
+
+
 def train_jtvae(
     model: JTVAE,
     dataset,
@@ -2439,7 +2504,7 @@ def train_jtvae(
     )
 
     # dataset should provide precomputed: tree_x, tree_edge_index, graph_x, graph_edge_index, target_frag_idxs, cond
-    loader_kwargs = {"batch_size": batch_size, "shuffle": True}
+    loader_kwargs = {"batch_size": batch_size, "sampler": _TorchRandomSampler(dataset)}
     if device_spec.is_cuda:
         loader_kwargs["pin_memory"] = True
     loader = PyGDataLoader(dataset, **loader_kwargs)
@@ -2449,7 +2514,7 @@ def train_jtvae(
     start_epoch = max(1, int(start_epoch))
     if epochs <= 0:
         logger.warning("JT-VAE training skipped because epochs=%s.", epochs)
-        return model
+        return getattr(model, "_orig_mod", model)
     final_epoch = start_epoch + epochs - 1
     best_loss = float("inf")
     history: List[Dict[str, float]] = []
@@ -2595,10 +2660,11 @@ def train_jtvae(
         _append_live_cli(epoch_line)
         scheduler.step(epoch_total_avg)
         is_best = epoch_total_avg < best_loss
+        checkpoint_model = getattr(model, "_orig_mod", model)
         if is_best:
             best_loss = epoch_total_avg
-            torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, "jtvae_best.pt"))
-        torch.save(ensure_state_dict_on_cpu(model, device_spec), os.path.join(save_dir, f"jtvae_epoch_{epoch}.pt"))
+            torch.save(ensure_state_dict_on_cpu(checkpoint_model, device_spec), os.path.join(save_dir, "jtvae_best.pt"))
+        torch.save(ensure_state_dict_on_cpu(checkpoint_model, device_spec), os.path.join(save_dir, f"jtvae_epoch_{epoch}.pt"))
 
         should_update_live_decode = (
             live_decode_enabled
@@ -2671,8 +2737,9 @@ def train_jtvae(
         _append_live_cli("Training beendet, lokale Ansicht bleibt erreichbar.")
 
     if len(dataset) > 0:
+        eval_model = getattr(model, "_orig_mod", model)
         val_metrics = _evaluate_jtvae(
-            model,
+            eval_model,
             dataset,
             fragment_vocab,
             device_spec,
@@ -2688,7 +2755,7 @@ def train_jtvae(
             val_metrics.get("uniqueness", 0.0),
             val_metrics.get("novelty", 0.0),
         )
-    return model
+    return getattr(model, "_orig_mod", model)
 
 
 def _evaluate_jtvae(
@@ -2808,21 +2875,36 @@ def sample_conditional(
     if assemble_kwargs is None:
         assemble_kwargs = {}
 
-    max_tree_nodes = assemble_kwargs.get("max_tree_nodes", 12)
-    idx_to_frag = {idx: frag for frag, idx in fragment_vocab.items()}
+    max_tree_nodes = assemble_kwargs.get("max_tree_nodes", getattr(model, "max_tree_nodes", 12))
+    idx_to_frag = {int(idx): str(frag) for frag, idx in fragment_vocab.items()}
 
     cond_norm = None
     if cond is not None:
-        cond_arr = cond if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
-        cond_arr = np.atleast_2d(cond_arr)
-        if cond_stats and "mean" in cond_stats and "std" in cond_stats:
-            mean = np.asarray(cond_stats["mean"], dtype=np.float32)
-            std = np.asarray(cond_stats["std"], dtype=np.float32)
-            std = np.where(std < 1e-8, 1.0, std)
-            cond_arr = (cond_arr - mean) / std
-        cond_norm = cond_arr.squeeze() if cond_arr.shape[0] > 1 else cond_arr[0]
-        if model.cond_dim and cond_norm.shape[-1] != model.cond_dim:
-            raise ValueError(f"Provided cond dim {cond_norm.shape[-1]} != model cond_dim {model.cond_dim}")
+        if torch.is_tensor(cond):
+            cond_t = cond.detach().float()
+            if cond_t.dim() == 1:
+                cond_t = cond_t.unsqueeze(0)
+            elif cond_t.dim() > 2:
+                cond_t = cond_t.reshape(cond_t.size(0), -1)
+            if cond_stats and "mean" in cond_stats and "std" in cond_stats:
+                mean = torch.tensor(cond_stats["mean"], dtype=cond_t.dtype, device=cond_t.device)
+                std = torch.tensor(cond_stats["std"], dtype=cond_t.dtype, device=cond_t.device)
+                std = torch.where(std < 1e-8, torch.ones_like(std), std)
+                cond_t = (cond_t - mean) / std
+            cond_norm = cond_t
+            cond_dim = int(cond_t.size(-1))
+        else:
+            cond_arr = cond if isinstance(cond, np.ndarray) else np.asarray(cond, dtype=np.float32)
+            cond_arr = np.atleast_2d(cond_arr)
+            if cond_stats and "mean" in cond_stats and "std" in cond_stats:
+                mean = np.asarray(cond_stats["mean"], dtype=np.float32)
+                std = np.asarray(cond_stats["std"], dtype=np.float32)
+                std = np.where(std < 1e-8, 1.0, std)
+                cond_arr = (cond_arr - mean) / std
+            cond_norm = cond_arr if cond_arr.shape[0] > 1 else cond_arr[0]
+            cond_dim = int(cond_arr.shape[-1])
+        if model.cond_dim and cond_dim != model.cond_dim:
+            raise ValueError(f"Provided cond dim {cond_dim} != model cond_dim {model.cond_dim}")
 
     raw_samples = model.sample(
         n_samples=n_samples,

@@ -142,38 +142,9 @@ def train_surrogate_3d_full(args: argparse.Namespace) -> None:
     print(f"Full SchNet surrogate trained; best model saved to {sch_cfg.save_dir/'schnet_full.pt'}")
 
 def _load_jtvae_from_ckpt(ckpt: Path, fragment_vocab_size: int, cond_dim: int) -> JTVAE:
-    from src.models.jtvae_extended import JTVAE
+    from src.models.jtvae_extended import JTVAE, normalize_jtvae_state_dict
 
-    raw = torch.load(ckpt, map_location="cpu")
-
-    # Support both plain state_dict checkpoints and training bundles.
-    if isinstance(raw, dict):
-        for container_key in ("state_dict", "model_state_dict", "generator_state_dict", "model"):
-            nested = raw.get(container_key)
-            if isinstance(nested, dict):
-                raw = nested
-                break
-    if not isinstance(raw, dict):
-        raise TypeError(f"Unsupported checkpoint format at {ckpt}: {type(raw)!r}")
-
-    def _normalize_keys(sd: dict) -> dict:
-        prefixes = ("module.", "_orig_mod.", "model.", "generator.")
-        normalized = {}
-        for key, value in sd.items():
-            if not isinstance(key, str):
-                continue
-            k = key.replace("._orig_mod.", ".")
-            changed = True
-            while changed:
-                changed = False
-                for prefix in prefixes:
-                    if k.startswith(prefix):
-                        k = k[len(prefix) :]
-                        changed = True
-            normalized[k] = value
-        return normalized
-
-    state = _normalize_keys(raw)
+    state = normalize_jtvae_state_dict(torch.load(ckpt, map_location="cpu"))
 
     def _resolve_key(*candidates: str) -> Optional[str]:
         for cand in candidates:
@@ -1218,8 +1189,12 @@ def run_active_loop(args: argparse.Namespace) -> None:
                     if not is_training:
                         model.eval()
             stacked = torch.stack(all_passes, dim=0)  # [n_passes, N, D]
-            mean = stacked.mean(dim=0).numpy()
-            std = stacked.std(dim=0, unbiased=True).numpy() if stacked.shape[0] > 1 else np.zeros_like(mean)
+            mean = np.asarray(stacked.mean(dim=0).tolist(), dtype=np.float32)
+            std = (
+                np.asarray(stacked.std(dim=0, unbiased=True).tolist(), dtype=np.float32)
+                if stacked.shape[0] > 1
+                else np.zeros_like(mean)
+            )
             return mean, std, None
 
         def fit(self, train_df, val_df=None):

@@ -118,6 +118,17 @@ def _resolve_device(device_spec: str):
     return dev
 
 
+class _TorchRandomSampler(torch.utils.data.Sampler[int]):
+    def __init__(self, data_source):
+        self.data_source = data_source
+
+    def __iter__(self):
+        return iter(torch.randperm(len(self.data_source)).tolist())
+
+    def __len__(self):
+        return len(self.data_source)
+
+
 def train_schnet_full(
     train_ds,
     val_ds=None,
@@ -155,7 +166,7 @@ def train_schnet_full(
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 4
 
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    train_loader = DataLoader(train_ds, sampler=_TorchRandomSampler(train_ds), **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs) if val_ds is not None else None
 
     loss_is_l1 = str(cfg.loss).lower() == "l1"
